@@ -1,0 +1,979 @@
+---
+title: "Amino acid tracking"
+author: "Edward Cruz"
+date: "2026-04-23"
+output: github_document
+---
+
+
+```{r Libraries }
+
+rm(list=ls(all=T))
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(Biostrings)
+library(Peptides)
+library(stringr)
+library(ggbreak)
+library(patchwork)
+
+knitr::opts_chunk$set(fig.path = "figures/AA-Tracking_Fly_and_Frog/")
+
+```
+
+
+```{r Importing fly timecourse values }
+
+Fly_heavy_time <- c(257, 287, 320, 351, 386, 441, 500,
+                     565, 682, 868, 995, 1218, 1514) - 257
+Fly_light_time <- c(0, Fly_heavy_time[c(4, 8, 11, 13)])
+
+Fly_heavy_hpf_time <- ((Fly_heavy_time + 257) + (Fly_heavy_time + 117))/2
+Fly_heavy_hpf_time <- Fly_heavy_hpf_time / 60
+
+Fly_light_hpf_time <- c(Fly_heavy_hpf_time[1], Fly_heavy_hpf_time[c(4, 8, 11, 13)])
+
+```
+
+
+```{r Importing frog timecourse values }
+
+Frog_T5_all.min <- c(161, 221, 281, 401, 521, 641,
+                     881, 1605, 1961, 2918, 4405) - 161
+Frog_T5_light.min <- Frog_T5_all.min[c(1:2, 4:5, 7:8, 10:11)]
+Frog_T6_all.min <- c(150, 210, 270, 390, 510, 635,
+                     930, 1591, 1950, 2910, 4394) - 150
+Frog_T6_light.min <- Frog_T6_all.min[c(1:2, 4:5, 7:8, 10:11)]
+
+Frog_heavy_time <- (Frog_T5_all.min + Frog_T6_all.min)/2
+Frog_light_time <- (Frog_T5_light.min + Frog_T6_light.min)/2
+
+Frog_heavy_hpf_time <- (Frog_heavy_time + ((161+150)/2))/60
+Frog_light_hpf_time <- (Frog_light_time + ((161+150)/2))/60
+
+```
+
+
+```{r Importing frog and fly turnover fits }
+
+XLA_2C_fits <- read.csv("Files/Fits/Dyn-Model/XLA_O18_T5-6_FinalFits_ALL.csv")
+Fly_gast_fits <- read.csv("Files/Fits/Dyn-Model/Fly_O18_T6-7_FinalFits_ALL.csv")
+
+```
+
+
+```{r Setting yolk proteins }
+
+fly_yolk_set <- c("P02843", "P02844", "P06607")
+names(fly_yolk_set) <- c("Yp1", "Yp2", "Yp3")
+
+frog_yolk_set <- c("XBmRNA35014|XBXL10_1g18990", "XBmRNA39801|XBXL10_1g21498",
+                   "XBmRNA35013|XBXL10_1g18989", "XBmRNA35012|XBXL10_1g18988",
+                   "XBmRNA67639|XBXL10_1g35803")
+names(frog_yolk_set) <- c("vtgb1.L", "vtgb1.S", "vtga1.L", "vtga2.L", "serpina")
+
+```
+
+
+```{r Vectors for all amino acids and those that are essential }
+
+aa_vector <- c("A", "C", "D", "E", "F", "G", "H", "I", 
+               "K", "L", "M", "N", "P", "Q", "R", "S", 
+               "T", "V", "W", "Y")
+emb_essential_AAs <- c("F", "W", "I", "L", "V", "K",
+                       "H", "T", "M", "C", "Y")
+
+```
+
+
+```{r Importing absolute abundance concentrations }
+
+XLA_RT0_Abs <- read.csv("Files/AbsC/XLA_RT0_Abs-Concentrations.csv")
+XLA_N12_Abs <- read.csv("Files/AbsC/XLA_N12_Abs-Concentrations.csv")
+Dmel_T0_Abs <- read.csv("Files/AbsC/Dmel_T0_Abs-Concentrations.csv")
+Dmel_N16_Abs <- read.csv("Files/AbsC/Dmel_N16_Abs-Concentrations.csv")
+
+XLA_abs_conc <- merge(XLA_RT0_Abs[1:2], XLA_N12_Abs[c(1:2,4)], by="Ind_Protein_ID",
+      suffixes=c("_Start", "_Late"))
+Dmel_abs_conc <- merge(Dmel_T0_Abs[1:2], Dmel_N16_Abs[c(1:2,4)], by="Ind_Protein_ID",
+      suffixes=c("_Start", "_Late"))
+
+XLA_abs_conc <- XLA_abs_conc[XLA_abs_conc$Ind_Protein_ID %in% 
+                               c(XLA_2C_fits$Protein_ID, frog_yolk_set),]
+Dmel_abs_conc <- Dmel_abs_conc[Dmel_abs_conc$Ind_Protein_ID %in%
+                                 c(Fly_gast_fits$Protein_ID, fly_yolk_set),]
+
+```
+
+
+```{r Calculating frog amino acids created and needed }
+
+GB_NYS_df <- read.csv("Data/XLA_Norm/XLA-O18_GB-FinalDataset.csv")
+XLA_yolk_trend <- GB_NYS_df[GB_NYS_df$Protein_ID %in% frog_yolk_set,]
+
+XLA_yolk_FC <- XLA_yolk_trend$T8 / XLA_yolk_trend$T0
+names(XLA_yolk_FC) <- XLA_yolk_trend$Protein_ID
+
+modify_frog_abs <- function(df){
+
+  nonyolk_df <- df[!df$Ind_Protein_ID %in% frog_yolk_set,]
+
+  nonyolk_fits <- XLA_2C_fits[XLA_2C_fits$Protein_ID %in% nonyolk_df$Ind_Protein_ID,]
+  
+  nonyolk_fits["lightFC"] <- nonyolk_fits$N12 / nonyolk_fits$T0_L
+  nonyolk_fits["heavyFC"] <- nonyolk_fits$O12 / nonyolk_fits$T0_H
+  nonyolk_fits[nonyolk_fits$heavyFC > 1, "heavyFC"] <- 1
+
+  nonyolk_fits["AbsCategory"] <- rep("CHANGE", nrow(nonyolk_fits))
+  nonyolk_fits[nonyolk_fits$lightFC > 1, "AbsCategory"] <- "Inc"
+  nonyolk_fits[nonyolk_fits$lightFC < 1, "AbsCategory"] <- "Dec"
+
+  nonyolk_final <- lapply(nonyolk_df$Ind_Protein_ID, function(x){
+    fit_row <- nonyolk_fits[nonyolk_fits$Protein_ID == x,]
+    abs_row <- nonyolk_df[nonyolk_df$Ind_Protein_ID == x,]
+    start_conc <- abs_row$iBAQ_Conc_Start
+    
+    T_end <- tail(Frog_light_time, 1)
+
+    if (fit_row$mClass == "Deg") { surv <- exp(-fit_row$kD * T_end) }
+    else { surv <- 1 }
+    
+    conc_deg    <- start_conc * (1 - surv)
+    conc_needed <- max(start_conc * fit_row$lightFC - start_conc * surv, 0)
+
+    outline <- data.frame(Protein_ID = x, StartConc = start_conc,
+                          Conc_Deg = conc_deg,
+                          Conc_Synth = conc_needed,
+                          Sequence = abs_row$Sequence)
+
+    return(outline) }) %>% bind_rows
+
+  #------------------------------------------
+  
+  yolk_df <- df[df$Ind_Protein_ID %in% frog_yolk_set,]
+
+  yolk_final <- lapply(yolk_df$Ind_Protein_ID, function(yolk_id){
+    row <- yolk_df[yolk_df$Ind_Protein_ID == yolk_id,]
+    
+    start_conc <- row$iBAQ_Conc_Start
+    nospin_FC <- XLA_yolk_FC[yolk_id]
+    
+    conc_deg <- start_conc-(start_conc * nospin_FC)
+    conc_needed <- 0
+    
+    outline <- data.frame(Protein_ID = yolk_id, StartConc = start_conc,
+                          Conc_Deg = conc_deg,
+                          Conc_Synth = conc_needed,
+                          Sequence = row$Sequence)
+    
+    return(outline) }) %>% bind_rows
+
+  out_df <- rbind(yolk_final, nonyolk_final)
+  row.names(out_df) <- NULL
+  
+  return(out_df) }
+
+XLA_prot_concs <- modify_frog_abs(XLA_abs_conc)
+head(XLA_prot_concs)
+
+```
+
+
+```{r Calculating fly amino acids created and needed }
+
+modify_fly_abs <- function(df){
+
+  fits_df <- Fly_gast_fits[Fly_gast_fits$Protein_ID %in% df$Ind_Protein_ID,]
+
+  fits_df["lightFC"] <- fits_df$N16 / fits_df$T0_L
+  fits_df["heavyFC"] <- fits_df$O12 / fits_df$T0_H
+  fits_df[fits_df$heavyFC > 1, "heavyFC"] <- 1
+    
+  fits_df["AbsCategory"] <- rep("CHANGE", nrow(fits_df))
+  fits_df[fits_df$lightFC > 1, "AbsCategory"] <- "Inc"
+  fits_df[fits_df$lightFC < 1, "AbsCategory"] <- "Dec"
+
+  final_df <- lapply(df$Ind_Protein_ID, function(x){
+
+    fit_row <- fits_df[fits_df$Protein_ID == x,]
+    abs_row <- df[df$Ind_Protein_ID == x,]
+    start_conc <- abs_row$iBAQ_Conc_Start
+
+    T_end <- tail(Fly_light_time, 1)
+
+    if (fit_row$mClass == "Deg") { surv <- exp(-fit_row$kD * T_end) }
+    else { surv <- 1 }
+    
+    conc_deg    <- start_conc * (1 - surv)
+    conc_needed <- max(start_conc * fit_row$lightFC - start_conc * surv, 0)
+    
+    outline <- data.frame(Protein_ID = x, StartConc = start_conc,
+                          Conc_Deg = conc_deg,
+                          Conc_Synth = conc_needed,
+                          Sequence = abs_row$Sequence)
+
+    return(outline) }) %>% bind_rows
+
+  final_df <- final_df %>% arrange(desc(StartConc))
+  
+  return(final_df) }
+
+Dmel_prot_concs <- modify_fly_abs(Dmel_abs_conc)
+head(Dmel_prot_concs)
+
+```
+
+
+```{r Determining total pools of amino acids created and needed }
+
+calculate_AAs <- function(row) {
+
+  #Splits sequence into individual characters
+  chars <- strsplit(row["Sequence"], split = "")[[1]]
+  chars <- chars[chars %in% aa_vector]
+
+  #Setting order 
+  counts <- table(factor(chars, levels = aa_vector))
+
+  AA_needed <- counts * as.numeric(row["Conc_Synth"])
+  names(AA_needed) <- paste(names(AA_needed), "Need", sep="_")
+  
+  AA_gen <- counts * as.numeric(row["Conc_Deg"])
+  names(AA_gen) <- paste(names(AA_gen), "Gen", sep="_")
+    
+  outline <- data.frame(t(c(AA_needed, AA_gen)))
+  outline <- cbind(data.frame(Protein_ID=as.character(row["Protein_ID"])),
+                   outline)
+    
+  return(outline) }
+
+XLA_AA_tracking <- apply(XLA_prot_concs, 1, calculate_AAs) %>% bind_rows
+Dmel_AA_tracking <- apply(Dmel_prot_concs, 1, calculate_AAs) %>% bind_rows
+
+head(XLA_AA_tracking)
+
+```
+
+
+```{r Calculating frog pool values }
+
+#Sum of all amino acids needed for new protein synthesis + generated from deg
+frog_AA_sums <- apply(XLA_AA_tracking[2:41], 2, sum)
+
+#Amino acids needed to synthesize new protein
+frog_AA_needed <- frog_AA_sums[1:20]
+names(frog_AA_needed) <- aa_vector
+
+#Amino acids provided from degradation
+frog_AA_deg <- frog_AA_sums[21:40]
+names(frog_AA_deg) <- aa_vector
+
+#Amino acids provided from yolk
+frog_yolk_contribution <-
+  apply(XLA_AA_tracking[XLA_AA_tracking$Protein_ID %in%
+                           frog_yolk_set, 22:41], 2, sum)
+names(frog_yolk_contribution) <- aa_vector
+
+#Changing vector to only be amount provided by degradation w/out yolk
+frog_AA_deg <- frog_AA_deg - frog_yolk_contribution
+
+```
+
+
+```{r Calculating fly pool values }
+
+#Sum of all amino acids needed for new protein synthesis + generated from deg
+fly_AA_sums <- apply(Dmel_AA_tracking[2:41], 2, sum)
+
+#Amino acids needed to synthesize new protein
+fly_AA_needed <- fly_AA_sums[1:20]
+names(fly_AA_needed) <- aa_vector
+
+#Amino acids provided from degradation
+fly_AA_deg <- fly_AA_sums[21:40]
+names(fly_AA_deg) <- aa_vector
+
+#Amino acids provided from yolk
+fly_yolk_contribution <-
+  apply(Dmel_AA_tracking[Dmel_AA_tracking$Protein_ID %in%
+                           fly_yolk_set, 22:41], 2, sum)
+names(fly_yolk_contribution) <- aa_vector
+
+#Changing vector to only be amount provided by degradation w/out yolk
+fly_AA_deg <- fly_AA_deg - fly_yolk_contribution
+
+```
+
+
+Citations for frog nucleotides:
+
+https://www.pnas.org/doi/10.1073/pnas.51.1.139
+Gurdon and WIckens table
+
+Justification:
+
+To estimate the total metabolic cost of nucleic acids during our timecourse, we derived the net biosynthesis requirements from established literature. The Xenopus laevis embryo begins with roughly 12 pg of DNA, which expands to nearly 1 µg by late embryonic stages (Gurdon and Wickens, 1989; Gurdon and Brown, 1963). Additionally, studies utilizing anucleolate mutants that lack the ability to synthesize new rRNA demonstrate that the wild-type embryo synthesizes approximately 6 µg of net rRNA by the early swimming stages (Brown & Gurdon, 1964). Thus, the embryo requires the net synthesis of roughly 7 µg of the major nucleic acids by NF35. We treat the net mass accumulation of minor RNA species (mRNA, tRNA, etc) as negligible, as their combined net expansion (< 0.2 µg) is functionally subsumed by our upper-bound estimates for DNA and rRNA, which were derived from NF41 embryos. Furthermore, mitochondrial RNA remains static within our analysis window (Chase and David 1972). Given an average elemental nitrogen fraction of 15.5% for mixed biological nucleotides, the synthesis of 7 µg of net nucleic acid requires almost 1.1 µg of atomic nitrogen.
+
+Likewise, we repeated the same approximation in fly from established literature for the net biosynthesis requirements. We begin our experimental window at roughly 3 hours post-fertilization, a stage comprising approximately 6,000 diploid nuclei (Zalokar and Erk, 1976). Derived from a genome size of 180 megabases (Adams, et al. 2000), the diploid genome mass contains 0.36 pg DNA which corresponds to 2.2 ng of starting DNA. At the point of hatching, the embryo contains roughly 50,000 cells (Lehner et al., 2001). However, the fly embryo is known to enter the endocycle, where specific tissues (salivary gland, midgut, hindgut, Malpighian tubules, and dorsal cells) replicate their genomes an average of two additional times without cleavage (Smith and Orr-Weaver, 1991). Based on anatomical proportions, we estimate these tissues comprise roughly 10% of the embryo. Thus, by hatching, the embryo contains an approximate total of 23.9 ng of DNA, resulting in a net synthesis of 21.7 ng during our experimental window. We treat the net mass accumulation of bulk RNA species (rRNA, mRNA, tRNA, etc.) as negligible, as they are known not to appreciably increase during this developmental window (Anderson and Lengyel, 1979; Becker et al., 2018). Utilizing the 16.8% mass fraction of elemental nitrogen for the Drosophila genome, the synthesis of 21.8 ng of net DNA requires approximately 3.6 ng of atomic nitrogen.
+
+To allocate the atomic nitrogen demand, we modeled the free amino acid pool using a mass balance approach. First, an intermediate pool was established by summing yolk-derived and proteome-degraded amino acids, then subtracting the demands of de novo protein synthesis. Assuming rapid transaminase-driven equilibration, each amino acid's contribution was weighted by its intermediate molarity and atomic nitrogen count. These proportional nitrogen demands were then converted back into amino acid molarities, yielding the final physiological amino acid demands for nucleic acid synthesis.
+
+
+Math for fly nucleotides:
+
+- Genome size is 180 megabases (Adams 2000)
+> 978 megabases per picogram
+
+- 6,000 2C nuclei ~ 3.1 hpf (Zalokar and Erk 1976)
+> ((180x2/978)*6000)/1000
+[1] 2.208589
+
+> 2.2 ng DNA at 3.1 hpf
+
+- 50,000 cells at hatching (Lehner, et al. 2001)
+- 5,000 endocycle based on anatomical proportions -> 8C
+- 45,000 normal -> 2C
+
+- ((180*2/978)*45000)/1000 -> 16.6 ng from 2C cells
+- ((180*8/978)*5000)/1000 -> 7.4 ng from endocycle cells
+
+> 23.9 ng DNA at hatching
+
+- Thus, 21.7 ng DNA made during experimental window.
+
+Atomic nitrogen:
+> ((((180*2/978)*45000)/1000+((180*8/978)*5000)/1000)-(((180*2/978)*6000)/1000))*.168
+[1] 3.648589
+
+
+```{r Nitrogens per amino acid }
+
+aa_profiles <- read.csv("Files/Reference/AA_Profiles.csv")
+
+aa_nitrogens <- aa_profiles$Nitrogen
+names(aa_nitrogens) <- aa_profiles$AA
+aa_nitrogens <- aa_nitrogens[aa_vector]
+
+head(aa_nitrogens)
+
+```
+
+
+```{r Calculating frog nucleic acid demand }
+
+#Embryo needs 1 ug of nitrogen
+#Atomic nitrogen ~14.007 ug/umol
+#Cell volume is 1 uL
+frog_nuc_acid_nitrogen <- (((7*0.155)/14.007)/1)*1000
+
+#Amount leftover after protein synthesis is taken into account
+frog_AA_remaining <- (frog_yolk_contribution + frog_AA_deg) - frog_AA_needed
+
+#Mass action -> Each AA donates based on no. of nitrogens
+frog_N_pool <- frog_AA_remaining * aa_nitrogens
+frog_N_pool <- frog_N_pool / sum(frog_N_pool)
+
+#AAs used for nucleic acid synthesis
+frog_AA_nuc_synthesis <- frog_N_pool * frog_nuc_acid_nitrogen
+frog_AA_nuc_synthesis <- frog_AA_nuc_synthesis / aa_nitrogens
+
+final_frog_AA_leftover <- frog_AA_remaining - frog_AA_nuc_synthesis
+
+sum(final_frog_AA_leftover * aa_nitrogens)
+
+```
+
+
+```{r Calculating fly nucleic acid demand }
+
+fly_nuc_acid_nitrogen <- ((((180*2/978)*45000)/1000+((180*8/978)*5000)/1000)-
+                            (((180*2/978)*6000)/1000))*.168
+#Convert to grams and divide by g/mol
+fly_nuc_acid_nitrogen <- (fly_nuc_acid_nitrogen*10e-10)/(14.01)
+#Divide by 10nL (in L) to get Molar
+fly_nuc_acid_nitrogen <- fly_nuc_acid_nitrogen / (1e-8)
+fly_nuc_acid_nitrogen <- fly_nuc_acid_nitrogen * 1000
+
+#Amount leftover after protein synthesis is taken into account
+fly_AA_remaining <- (fly_yolk_contribution + fly_AA_deg) - fly_AA_needed
+
+#Mass action -> Each AA donates based on no. of nitrogens
+fly_N_pool <- fly_AA_remaining * aa_nitrogens
+fly_N_pool <- fly_N_pool / sum(fly_N_pool)
+
+#AAs used for nucleic acid synthesis
+fly_AA_nuc_synthesis <- fly_N_pool * fly_nuc_acid_nitrogen
+fly_AA_nuc_synthesis <- fly_AA_nuc_synthesis / aa_nitrogens
+
+final_fly_AA_leftover <- fly_AA_remaining - fly_AA_nuc_synthesis
+
+sum(final_fly_AA_leftover * aa_nitrogens)
+
+```
+
+
+```{r Frog supply and demand barplot }
+
+# your vectors: frog_AA_needed, frog_AA_deg, frog_AA_yolk
+# your essential list:
+# emb_essential_AAs <- c("F","W","I","L","V","K","H","T","M","C","Y")
+
+# ---- order: essentials first, then the rest (keep remaining in alphabetical order) ----
+aa_all <- sort(unique(names(frog_AA_needed)))               # assumes all three share names
+aa_levels <- c(emb_essential_AAs, setdiff(aa_all, emb_essential_AAs))
+
+# data for the stacked supply bar (Deg + Yolk)
+df_supply <- tibble(
+  AA = factor(aa_levels, levels = aa_levels),
+  Deg  = as.numeric(frog_AA_deg[aa_levels]),
+  Yolk = as.numeric(frog_yolk_contribution[aa_levels])) |>
+  pivot_longer(c(Deg, Yolk),
+               names_to = "component",
+               values_to = "value")
+
+# data for the single needed bar, plus essential flag
+df_needed <- tibble(
+  AA = factor(aa_levels, levels = aa_levels),
+  Synth = as.numeric(frog_AA_needed[aa_levels]),
+  Nuc = as.numeric(frog_AA_nuc_synthesis[aa_levels]),
+  essential = if_else(AA %in% emb_essential_AAs, "Essential", "Other")) |>
+  pivot_longer(c(Synth, Nuc),
+               names_to = "component",
+               values_to = "value")
+
+# numeric x positions to separate the two bars per AA
+df_supply$x <- as.numeric(df_supply$AA) + 0.22
+df_needed$x <- as.numeric(df_needed$AA) - 0.22
+
+p1 <- ggplot() +
+  # ----- stacked Deg+Yolk bar -----
+  geom_col(data = df_supply,
+           aes(x = x, y = value, fill = component),
+           width = 0.44, color="black") +
+  scale_fill_manual(values = c(Deg = "#0072B2", Yolk = "#F0E442"), name = NULL) +
+
+  # start a fresh fill scale so the next layer's colors don't clash
+  ggnewscale::new_scale_fill() +
+
+  # ----- single Needed bar with essential-specific colors -----
+  geom_col(data = df_needed,
+           aes(x = x, y = value, fill = component),
+           width = 0.44, color="black") +
+  scale_fill_manual(values = c(Synth = "grey90", Nuc = "grey60"),
+                    name = NULL) +
+
+  # ----- axes & theme -----
+  scale_x_continuous(breaks = seq_along(aa_levels), labels = aa_levels) +
+  labs(x = "Amino acid (AA)", y = "Concentration (mM)") +
+  theme_bw() +  #minimal(base_size = 12)
+  theme(axis.text=element_text(size=24,colour="black"),
+        plot.title = element_text(size=24, hjust=0.5),
+        axis.title = element_text(size=24),
+        panel.border = element_rect(linewidth=2),
+        legend.position = "none",
+        panel.grid.major = element_line(color = "grey90", linewidth = 0.25),
+        panel.grid.minor = element_line(color = "grey90", linewidth = 0.25)) 
+  # coord_cartesian(ylim=c(0,25))
+  # scale_y_continuous(position = "right")
+
+# #Uncomment for new image!
+# tiff("graph.tiff", units="in",
+#      width=7.5, height=4.5, res=300)
+
+p1
+  
+# dev.off() #Uncomment for new image!
+
+```
+
+
+```{r Fly supply and demand barplot }
+
+# your vectors: frog_AA_needed, frog_AA_deg, frog_AA_yolk
+# your essential list:
+# emb_essential_AAs <- c("F","W","I","L","V","K","H","T","M","C","Y")
+
+# ---- order: essentials first, then the rest (keep remaining in alphabetical order) ----
+aa_all <- sort(unique(names(fly_AA_needed)))               # assumes all three share names
+aa_levels <- c(emb_essential_AAs, setdiff(aa_all, emb_essential_AAs))
+
+# data for the stacked supply bar (Deg + Yolk)
+df_supply <- tibble(
+  AA = factor(aa_levels, levels = aa_levels),
+  Deg  = as.numeric(fly_AA_deg[aa_levels]),
+  Yolk = as.numeric(fly_yolk_contribution[aa_levels])) |>
+  pivot_longer(c(Deg, Yolk),
+               names_to = "component",
+               values_to = "value")
+
+# data for the single needed bar, plus essential flag
+df_needed <- tibble(
+  AA = factor(aa_levels, levels = aa_levels),
+  Synth = as.numeric(fly_AA_needed[aa_levels]),
+  Nuc = as.numeric(fly_AA_nuc_synthesis[aa_levels]),
+  essential = if_else(AA %in% emb_essential_AAs, "Essential", "Other")) |>
+  pivot_longer(c(Synth, Nuc),
+               names_to = "component",
+               values_to = "value")
+
+# numeric x positions to separate the two bars per AA
+df_supply$x <- as.numeric(df_supply$AA) + 0.22
+df_needed$x <- as.numeric(df_needed$AA) - 0.22
+
+p1 <- ggplot() +
+  # ----- stacked Deg+Yolk bar -----
+  geom_col(data = df_supply,
+           aes(x = x, y = value, fill = component),
+           width = 0.44, color="black") +
+  scale_fill_manual(values = c(Deg = "#0072B2", Yolk = "#F0E442"), name = NULL) +
+
+  # start a fresh fill scale so the next layer's colors don't clash
+  ggnewscale::new_scale_fill() +
+
+  # ----- single Needed bar with essential-specific colors -----
+  geom_col(data = df_needed,
+           aes(x = x, y = value, fill = component),
+           width = 0.44, color="black") +
+  scale_fill_manual(values = c(Synth = "grey90", Nuc = "grey60"),
+                    name = NULL) +
+
+  # ----- axes & theme -----
+  scale_x_continuous(breaks = seq_along(aa_levels), labels = aa_levels) +
+  labs(x = "Amino acid (AA)", y = "Concentration (mM)") +
+  theme_bw() +  #minimal(base_size = 12)
+  theme(axis.text=element_text(size=24,colour="black"),
+        plot.title = element_text(size=24, hjust=0.5),
+        axis.title = element_text(size=24),
+        panel.border = element_rect(linewidth=2),
+        legend.position = "none",
+        panel.grid.major = element_line(color = "grey90", linewidth = 0.25),
+        panel.grid.minor = element_line(color = "grey90", linewidth = 0.25)) +
+  coord_cartesian(ylim=c(0,25)) +
+  scale_y_continuous(position = "right")
+
+
+# #Uncomment for new image!
+# tiff("graph.tiff", units="in",
+#      width=7.5, height=4.5, res=300)
+
+p1
+  
+# dev.off() #Uncomment for new image!
+
+```
+
+
+Mesh plot as concentration
+
+```{r Determining values over time rather than as endpoint }
+
+mesh_calculator <- function(row, light_cols, heavy_cols, l_time, h_time) {
+  
+  start_conc <- as.numeric(row["StartConc"])
+  conc_deg <- as.numeric(row["Conc_Deg"])
+  conc_synth <- as.numeric(row["Conc_Synth"])  
+
+  light_trend <- as.numeric(row[light_cols])
+  light_FC <- light_trend / light_trend[1]
+  kd <- as.numeric(row["kD"])
+  start_conc <- as.numeric(row["StartConc"])
+
+  #-------------------------------------------------
+  
+  if (row["mClass"] == "Deg") { 
+    surv_L  <- exp(-kd * l_time)    
+    surv_H  <- exp(-kd * h_time) }
+  else {
+    surv_L <- rep(1, length(l_time))    
+    surv_H <- rep(1, length(h_time)) }
+  
+  protein_degraded <- start_conc * surv_H  
+
+  #-------------------------------------------------
+
+  protein_made <- pmax(start_conc * light_FC - start_conc * surv_L, 0)
+
+  outline <- data.frame(t(c(protein_made, protein_degraded)))
+  colnames(outline) <- c(names(row[light_cols]), names(row[heavy_cols]))
+  outline <- cbind(data.frame(Protein_ID = as.character(row["Protein_ID"])),
+                   outline)
+  
+  return(outline) }
+
+
+XLA_mesh_conc <- merge(XLA_prot_concs[1:4],
+                       XLA_2C_fits[!XLA_2C_fits$Protein_ID %in% frog_yolk_set,],
+                       by="Protein_ID")
+
+XLA_mesh_conc <- apply(XLA_mesh_conc, 1, function(row){
+  mesh_calculator(row, 13:20, 21:31, Frog_light_time, Frog_heavy_time) }) %>% bind_rows
+
+Fly_mesh_conc <- merge(Dmel_prot_concs[1:4], Fly_gast_fits, by="Protein_ID")
+
+
+Fly_mesh_conc <- apply(Fly_mesh_conc, 1, function(row){
+  mesh_calculator(row, 12:16, 17:29, Fly_light_time, Fly_heavy_time)}) %>% bind_rows
+
+head(XLA_mesh_conc)
+head(Fly_mesh_conc)
+
+```
+
+
+```{r Calculating yolk contribution independently from GB NYS experiment }
+
+GB_NYS_time <- c(176, 286, 420, 807, 1488, 1920, 2930, 3641, 4406)
+
+XLA_yolk_conc <- apply(merge(XLA_prot_concs[1:4], XLA_yolk_trend,
+                              by="Protein_ID"), 1,
+  function(row) {
+    start_conc <- as.numeric(row["StartConc"])
+    conc_deg <- as.numeric(row["Conc_Deg"])
+    heavy_average <- as.numeric(row[5:13])
+    heavy_average <- heavy_average/mean(heavy_average)
+
+    # Maximum relative drop in raw vector + scaling factor
+    max_rel_drop <- heavy_average[1] - tail(heavy_average, 1)
+    H_scaling_factor <- conc_deg / max_rel_drop
+    
+    # For every point, calculate how far it has dropped from the start,
+    # multiply by the scaling factor, and subtract it from your starting concentration.
+    absolute_heavy_pool <- start_conc - ((heavy_average[1] - 
+                                            heavy_average) * H_scaling_factor)
+    names(absolute_heavy_pool) <- names(row[5:13])
+    absolute_heavy_pool <- cummin(absolute_heavy_pool) #fixes to a strict decline
+
+    outline <- data.frame(t(absolute_heavy_pool))
+    outline <- cbind(data.frame(Protein_ID = as.character(row["Protein_ID"])),
+                     outline)
+
+    return(outline) }) %>% bind_rows
+
+head(XLA_yolk_conc)
+
+```
+
+
+```{r Calculating mesh as concentration for frog }
+
+XLA_mesh_conc_avg <- apply(XLA_mesh_conc[!XLA_mesh_conc$Protein_ID %in%
+                                    frog_yolk_set, 2:20], 2, sum) %>%
+  as.data.frame()
+colnames(XLA_mesh_conc_avg) <- "Trend"
+XLA_mesh_conc_avg["Time"] <- c(Frog_light_hpf_time, Frog_heavy_hpf_time)
+XLA_mesh_conc_avg["Type"] <- c(rep("New", length(Frog_light_hpf_time)),
+                               rep("Start", length(Frog_heavy_hpf_time)))
+
+XLA_yolk_conc_avg <- apply(XLA_yolk_conc[2:10], 2, sum) %>%
+  as.data.frame
+
+colnames(XLA_yolk_conc_avg) <- "Trend"
+XLA_yolk_conc_avg["Time"] <- GB_NYS_time/60
+XLA_yolk_conc_avg["Type"] <- "Yolk"
+
+XLA_mesh_conc_avg <- rbind(XLA_mesh_conc_avg, XLA_yolk_conc_avg)
+
+head(XLA_mesh_conc_avg)
+
+```
+
+
+```{r Calculating mesh as concentration for fly }
+
+Fly_yolk_conc_avg<- apply(Fly_mesh_conc[Fly_mesh_conc$Protein_ID %in%
+                                    fly_yolk_set,7:19], 2, sum) %>%
+  as.data.frame()
+colnames(Fly_yolk_conc_avg) <- "Trend"
+Fly_yolk_conc_avg["Time"] <- Fly_heavy_hpf_time
+Fly_yolk_conc_avg["Type"] <- "Yolk"
+
+Fly_mesh_conc_avg <- apply(Fly_mesh_conc[!Fly_mesh_conc$Protein_ID %in%
+                                    fly_yolk_set,2:19], 2, sum) %>%
+  as.data.frame()
+colnames(Fly_mesh_conc_avg) <- "Trend"
+Fly_mesh_conc_avg["Time"] <- c(Fly_light_hpf_time, Fly_heavy_hpf_time)
+Fly_mesh_conc_avg["Type"] <- c(rep("New", length(Fly_light_hpf_time)),
+                               rep("Start", length(Fly_heavy_hpf_time)))
+Fly_mesh_conc_avg <- rbind(Fly_mesh_conc_avg, Fly_yolk_conc_avg)
+
+```
+
+
+```{r Mesh plots for frog and fly as concentration over time }
+
+mesh_plot <- function(df, xlab="Hours Post-Fertilization", ylab="Protein",
+                      fun_breaks, approx_x_min, approx_x_max) {
+  
+  time_grid <- seq(approx_x_min, approx_x_max, length.out = 100)
+  
+  new_interp <- approx(df[df$Type == "New",]$Time,
+                       df[df$Type == "New",]$Trend,
+                       xout = time_grid)$y
+
+  start_interp <- approx(df[df$Type == "Start",]$Time,
+                         df[df$Type == "Start",]$Trend,
+                         xout = time_grid)$y
+  
+  yolk_interp <- approx(df[df$Type == "Yolk",]$Time,
+                        df[df$Type == "Yolk",]$Trend,
+                        xout = time_grid)$y
+
+  # Stacked total must not exceed the initial (t0) total. Start and Yolk are
+  # fitted/monotone curves; New is the observed, noise-prone term, so any
+  # overshoot is attributed to (and trimmed from) New.
+  total0     <- new_interp[1] + start_interp[1] + yolk_interp[1]
+  headroom   <- pmax(total0 - start_interp - yolk_interp, 0)
+  new_interp <- pmin(new_interp, headroom)  
+  
+  interp_df <- data.frame(Time=rep(time_grid, 3),
+                          Trend=c(new_interp, start_interp, yolk_interp),
+                          Type=c(rep("New", length(time_grid)),
+                                 rep("Start", length(time_grid)),
+                                 rep("Yolk", length(time_grid))))
+  # interp_df["Type"] <- factor(interp_df$Type, levels=c("New", "Start", "Yolk"))
+  interp_df["Type"] <- factor(interp_df$Type, levels=c("Yolk", "New", "Start"))
+  
+  # interp_df <- data.frame(Time=rep(time_grid, 2),
+  #                         Trend=c(new_interp, start_interp),
+  #                         Type=c(rep("New", length(time_grid)),
+  #                                rep("Start", length(time_grid))))
+  # interp_df["Type"] <- factor(interp_df$Type, levels=c("New", "Start"))
+  
+  p1 <- ggplot(interp_df, aes(x = Time, y = Trend, fill = Type)) +
+    geom_area(position = "stack", color="black", linewidth=0.5) +
+    # scale_fill_manual(values = c("New" = "#E69F00", "Start" = "#999999")) +
+    scale_fill_manual(values = c("New" = "#E69F00", "Start" = "#999999",
+                                 "Yolk"="#56B4E9")) +
+    labs(x = xlab, y = ylab) +
+    theme_bw() +
+    theme(axis.text= element_text(size=21,colour="black"),
+          # axis.text.y = element_blank(),
+          # axis.ticks = element_blank(),
+          plot.title = element_text(size=24, hjust=0.5),
+          axis.title = element_text(size=22),
+          panel.border = element_rect(linewidth=2),
+          legend.position = "none",
+          panel.grid.major = element_line(color = "grey90", linewidth = 0.25),
+          panel.grid.minor = element_line(color = "grey90", linewidth = 0.25)) +
+    scale_x_continuous(breaks=fun_breaks)
+
+  return(p1) }
+
+# #Uncomment for new image!
+# tiff("graph.tiff", units="in",
+#      width=5, height=4.5, res=300)
+
+mesh_plot(XLA_mesh_conc_avg, xlab="Hours Post-Fertilization (16°C)",
+          ylab="Protein Concentration", fun_breaks=c(3, 24, 48, 72),
+          approx_x_min=3, approx_x_max=72)
+
+mesh_plot(Fly_mesh_conc_avg, xlab="Hours Post-Fertilization (22°C)",
+          ylab="Protein Concentration", fun_breaks=c(3, 10, 24),
+          approx_x_min=3.2, approx_x_max=24)
+
+# dev.off() #Uncomment for new image!
+
+```
+
+
+# Mesh plot as protein amount
+
+```{r Importing fasta files and calculating molecular weights }
+
+#FASTA file used to search data
+frog_fasta <- readAAStringSet("Files/FASTA/XENLA_longest-transcript_10p1_GFY-Fix.fasta")
+
+#Converting to a dataframe for merging
+frog_sizes <- data.frame(
+  Protein_ID = names(frog_fasta),
+  Sequence = as.character(frog_fasta),
+  stringsAsFactors = FALSE )
+row.names(frog_sizes) <- NULL
+frog_sizes["Protein_ID"] <- sapply(strsplit(frog_sizes$`Protein_ID`, split = " "),
+                                   "[", 1)
+
+#FASTA file used to search data
+fly_fasta <- readAAStringSet("Files/Reference/Dmel_Uniprot_Proteome_092722.fasta")
+
+#Converting to a dataframe for merging
+fly_sizes <- data.frame(
+  Protein_ID = names(fly_fasta),
+  Sequence = as.character(fly_fasta),
+  stringsAsFactors = FALSE )
+row.names(fly_sizes) <- NULL
+fly_sizes["Protein_ID"] <- sapply(strsplit(fly_sizes$`Protein_ID`, split = " "),
+                                  "[", 1)
+fly_sizes["Protein_ID"] <- sapply(strsplit(fly_sizes$Protein_ID, split = "\\|"),
+                                  "[", 2)
+#---- Calculating MW ----------
+
+frog_sizes["Sequence"] <- str_remove_all(frog_sizes$Sequence,
+                                         "(?i)[^ARNDCEQGHILKMFPSTWYV]")
+fly_sizes["Sequence"] <- str_remove_all(fly_sizes$Sequence,
+                                        "(?i)[^ARNDCEQGHILKMFPSTWYV]")
+
+frog_sizes["kDa"] <- sapply(frog_sizes$Sequence, function(seq){
+    return(mw(seq)/1000) })
+fly_sizes["kDa"] <- sapply(fly_sizes$Sequence, function(seq){
+    return(mw(seq)/1000) })
+
+frog_sizes <- frog_sizes %>% dplyr::select(Protein_ID, kDa)
+fly_sizes <- fly_sizes %>% dplyr::select(Protein_ID, kDa)
+
+```
+
+
+```{r Exchanging concentrations for protein amounts }
+
+mesh_ug_conv <- function(row, data_cols, volume) {
+  
+  size <- as.numeric(row["kDa"])
+  conc_vec <- row[data_cols]
+
+  ug_vec <- as.numeric(conc_vec) * volume * size
+  names(ug_vec) <- names(conc_vec)
+  
+  outline <- data.frame(t(ug_vec))
+  outline <- cbind(data.frame(Protein_ID = as.character(row["Protein_ID"])),
+                   outline)
+
+  return(outline) }
+
+frog_mesh_ug <- apply(merge(frog_sizes, XLA_mesh_conc[!XLA_mesh_conc$Protein_ID %in% frog_yolk_set,],
+                            by="Protein_ID"),
+                      1, function(x) { mesh_ug_conv(x, 3:21, 1) }) %>% bind_rows
+
+fly_mesh_ug <- apply(merge(fly_sizes, Fly_mesh_conc, by="Protein_ID"),
+      1, function(x) { mesh_ug_conv(x, 3:20, 0.01) }) %>% bind_rows
+
+frog_mesh_yolk_ug <- apply(merge(frog_sizes, XLA_yolk_conc, by="Protein_ID"), 1,
+                           function(x) { mesh_ug_conv(x, 3:11, 1) }) %>% bind_rows
+
+```
+
+
+```{r Calculating mesh as amount for frog }
+
+XLA_mesh_ug_avg <- apply(frog_mesh_ug[!frog_mesh_ug$Protein_ID %in%
+                                        frog_yolk_set, 2:20], 2, sum) %>%
+  as.data.frame()
+colnames(XLA_mesh_ug_avg) <- "Trend"
+XLA_mesh_ug_avg["Time"] <- c(Frog_light_hpf_time, Frog_heavy_hpf_time)
+XLA_mesh_ug_avg["Type"] <- c(rep("New", length(Frog_light_hpf_time)),
+                             rep("Start", length(Frog_heavy_hpf_time)))
+
+XLA_yolk_ug_avg <- apply(frog_mesh_yolk_ug[2:10], 2, sum) %>%
+  as.data.frame
+
+colnames(XLA_yolk_ug_avg) <- "Trend"
+XLA_yolk_ug_avg["Time"] <- GB_NYS_time/60
+XLA_yolk_ug_avg["Type"] <- "Yolk"
+
+XLA_mesh_ug_avg <- rbind(XLA_mesh_ug_avg, XLA_yolk_ug_avg)
+
+```
+
+
+```{r Calculating mesh as amount for fly }
+
+Fly_yolk_ug_avg<- apply(fly_mesh_ug[fly_mesh_ug$Protein_ID %in%
+                                    fly_yolk_set,7:19], 2, sum) %>%
+  as.data.frame()
+colnames(Fly_yolk_ug_avg) <- "Trend"
+Fly_yolk_ug_avg["Time"] <- Fly_heavy_hpf_time
+Fly_yolk_ug_avg["Type"] <- "Yolk"
+
+Fly_mesh_ug_avg <- apply(fly_mesh_ug[!fly_mesh_ug$Protein_ID %in%
+                                    fly_yolk_set,2:19], 2, sum) %>%
+  as.data.frame()
+colnames(Fly_mesh_ug_avg) <- "Trend"
+Fly_mesh_ug_avg["Time"] <- c(Fly_light_hpf_time, Fly_heavy_hpf_time)
+Fly_mesh_ug_avg["Type"] <- c(rep("New", length(Fly_light_hpf_time)),
+                             rep("Start", length(Fly_heavy_hpf_time)))
+Fly_mesh_ug_avg <- rbind(Fly_mesh_ug_avg, Fly_yolk_ug_avg)
+
+```
+
+
+```{r Mesh plots for frog and fly as amount over time }
+
+# #Uncomment for new image!
+# tiff("graph.tiff", units="in",
+#      width=10, height=4.5, res=300)
+
+mesh_plot(XLA_mesh_ug_avg, xlab="Hours post-fertilization (16°C)",
+          ylab="Protein amount (μg)", fun_breaks=c(3, 24, 48, 72),
+          approx_x_min=3, approx_x_max=72) |
+mesh_plot(Fly_mesh_ug_avg, xlab="Hours post-fertilization (22°C)",
+          ylab="Protein amount (μg)", fun_breaks=c(3, 10, 24),
+          approx_x_min=3.2, approx_x_max=24) +
+  theme(axis.title.y = element_blank())
+
+# dev.off() #Uncomment for new image!
+
+```
+
+
+```{r Splitting frog data to show more nonyolk part }
+
+frog_base_mesh <- mesh_plot(XLA_mesh_ug_avg, xlab="Hours post-fertilization (16°C)",
+                            ylab="Protein amount (μg)", fun_breaks=c(3, 24, 48, 72),
+                            approx_x_min=3, approx_x_max=72)
+
+frog_top_mesh <- frog_base_mesh +
+  coord_cartesian(ylim = c(290, 325)) +
+  scale_y_continuous(breaks=c(240, 280, 320)) +  
+  theme(axis.title.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        axis.text.x = element_blank(),
+        plot.margin = margin(t = 10, r = 5, b = 0,
+                             l = 10, unit = "pt"))
+
+frog_bottom_mesh <- frog_base_mesh +
+  coord_cartesian(ylim = c(-2.45, 60)) +
+  scale_y_continuous(breaks=c(0, 20, 40, 60)) +
+  theme(plot.margin = margin(t = 0, r = 5, b = 10,
+                             l = 10, unit = "pt"))
+
+frog_split_compiled <- (frog_top_mesh / frog_bottom_mesh) + 
+  plot_layout(heights = c(20, 80), axis_titles = "collect")
+
+
+fly_base_mesh <- mesh_plot(Fly_mesh_ug_avg, xlab="Hours post-fertilization (22°C)",
+          ylab="Protein amount (μg)", fun_breaks=c(3, 10, 24),
+          approx_x_min=3.2, approx_x_max=24) +
+  theme(plot.margin = margin(t = 10, r = 10, b = 10,
+                             l = 5, unit = "pt"),
+        axis.title.y = element_blank())
+
+# #Uncomment for new image!
+# tiff("graph.tiff", units="in",
+#      width=9.5, height=4.5, res=300)
+
+frog_split_compiled | fly_base_mesh
+
+# dev.off() #Uncomment for new image!
+
+```
+
+
+
+```{r}
+
+sessionInfo()
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+

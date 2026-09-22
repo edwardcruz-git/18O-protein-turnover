@@ -1,0 +1,1375 @@
+---
+title: "Frog No Spinout Proteomics"
+author: "Gloria Bao"
+date: "2026-05-04"
+output: github_document
+---
+
+
+```{r Libraries }
+
+rm(list=ls(all=T))
+library(tidyr)
+library(dplyr)
+library(stringr)
+library(data.table)
+library(ggplot2)
+library(patchwork)
+library(TOSTER)
+library(minpack.lm)
+library(enviPat)
+library(ggtext)
+
+knitr::opts_chunk$set(fig.path = "figures/Frog_GB_NYS-Proteomics/")
+
+```
+
+
+```{r Frog Annotations }
+
+human_map <- read.csv("Files/Reference/Xen10_to_Human_Name_Assign.csv")
+human_map["Protein_ID"] <- sapply(human_map$Protein_ID, function(x){
+  split_id <- strsplit(x, "\\|")[[1]]
+  reformat <- paste0(split_id[3], "|", split_id[2])
+
+  return(reformat) })
+
+human_map <- human_map[c("Protein_ID", "XLA_Gene", "Human_Gene")]
+
+frog_yolk_set <- c("XBmRNA35014|XBXL10_1g18990", "XBmRNA39801|XBXL10_1g21498",
+                   "XBmRNA35013|XBXL10_1g18989", "XBmRNA35012|XBXL10_1g18988",
+                   "XBmRNA67639|XBXL10_1g35803")
+names(frog_yolk_set) <- c("vtgb1.L", "vtgb1.S", "vtga1.L", "vtga2.L", "serpina")
+
+keratins <- human_map[grepl("KRT", human_map$Human_Gene),]$Protein_ID
+
+```
+
+
+```{r Timepoints and columns from Gloria }
+
+sn.cols <- c("126 Sn", "127n Sn", "127c Sn", "128n Sn", "128c Sn", "129n Sn",
+             "129c Sn", "130n Sn", "130c Sn", "131n Sn", "131c Sn", "132n Sn",
+             "132c Sn", "133n Sn", "133c Sn", "134n Sn", "134c Sn", "135n Sn")
+
+GB_timepoints <- c(176, 286, 420, 807, 1488, 1920, 2930, 3641, 4406) - 176
+
+```
+
+
+"XBgroup" IDs are a custom FASTA artifact resulting from shared protein sequences
+between multiple Xenbase annotated genes. Thus, we cannot uniquely identify them, and they
+are a large source of noise in frog data.
+
+-> Not removed in other scripts, but here, we are looking for a stable and consistent
+   protein set for normalization.
+
+ 
+```{r Correction Factors for first two Exp. }
+
+WI_Rep1 <- read.csv("Data/Gloria/GB_Frog-WideIsolation_NoSpinout_Rep1.csv")
+WI_Rep1 <- WI_Rep1[paste0("X", gsub(" ", ".", sn.cols))]
+WI_Rep1 <- apply(WI_Rep1, 2, sum)
+
+R1_Corr_Factor <- WI_Rep1[1:9]
+R1_Corr_Factor <- R1_Corr_Factor / sum(R1_Corr_Factor)
+
+R2_Corr_Factor <- WI_Rep1[10:18]
+R2_Corr_Factor <- R2_Corr_Factor / sum(R2_Corr_Factor)
+
+R1_Corr_Factor
+cat("\n")
+R2_Corr_Factor
+
+```
+
+
+```{r Correction Factors for last two Exp. }
+
+WI_Rep2 <- read.csv("Data/Gloria/GB_Frog-WideIsolation_NoSpinout_Rep2.csv")
+WI_Rep2 <- WI_Rep2[paste0("X", gsub(" ", ".", sn.cols))]
+WI_Rep2 <- apply(WI_Rep2, 2, sum)
+
+R3_Corr_Factor <- WI_Rep2[1:9]
+R3_Corr_Factor <- R3_Corr_Factor / sum(R3_Corr_Factor)
+
+R4_Corr_Factor <- WI_Rep2[10:18]
+R4_Corr_Factor <- R4_Corr_Factor / sum(R4_Corr_Factor)
+
+R3_Corr_Factor
+cat("\n")
+R4_Corr_Factor
+
+```
+
+
+```{r Filtering both 18plexes }
+
+filter_raw <- function(csv.file, timepoints) {
+
+  #Selecting columns needed for filtering and data analysis
+  raw.columns <- c('Protein ID', 'Parsimony', 'Peptide', 'z',  sn.cols)
+
+  data.df <- fread(input = csv.file, select = raw.columns) %>%
+    as.data.frame
+  data.df["Peptide"] <- sapply(data.df$Peptide, function(x){
+    return(str_split(x, "\\.")[[1]][2]) })
+  
+  #'*Parsimony, REV sequences, contaminants, and oxM*
+  data.df <- data.df[data.df$Parsimony %in% c("U", "R"),] #Drop NA Parsimony
+  data.df <- data.df[!grepl("#", data.df$`Protein ID`),] #Remove reverse sequences
+  data.df <- data.df[!grepl('contaminant', data.df$`Protein ID`),] #Remove contaminants
+  data.df <- data.df[!grepl("\\*", data.df$`Peptide`),] #Remove oxM
+  data.df <- data.df[data.df$z==2 | data.df$z==3, ]
+
+  #'*Missed Cleavages*
+  #Remove peptides with missed cleavages
+  # ... Contains KR after removing last AA
+  data.df <- data.df[!(grepl("K",
+                        str_sub(data.df$Peptide, end=-2))),]
+  data.df <- data.df[!(grepl("R",
+                        str_sub(data.df$Peptide, end=-2))),]
+
+  #Removing unnecessary columns and renaming data
+  data.df["Parsimony"] <- NULL
+
+  return(data.df) }
+
+RTS_Set1 <- filter_raw("Data/Gloria/ORC_07253_RTS_Frog_NoSpinout_Yolk-Proteomics_Shallow.csv")
+RTS_Set2 <- filter_raw("Data/Gloria/ORC_07366_RTS_Frog_NoSpinout_Yolk-Proteomics_Shallow.csv")
+
+RTS_Set1 <- RTS_Set1[!grepl("group", RTS_Set1$`Protein ID`),]
+RTS_Set1 <- RTS_Set1[!RTS_Set1$`Protein ID` %in% keratins,]
+
+RTS_Set2 <- RTS_Set2[!grepl("group", RTS_Set2$`Protein ID`),]
+RTS_Set2 <- RTS_Set2[!RTS_Set2$`Protein ID` %in% keratins,]
+
+head(RTS_Set1)
+head(RTS_Set2)
+
+```
+
+
+```{r Splitting 18plexes into 4 separate experiments }
+
+split_experiments <- function(df, cols) {
+
+  new_df <- df[c("Protein ID", "Peptide", "z", cols)]
+  colnames(new_df)[1] <- "Protein_ID"
+  
+  #Apply sn filter for 9 cols
+  new_df["sum_sn"] <- rowSums(new_df[cols])
+  new_df <- new_df[(new_df$z==2 & new_df$sum_sn>129)|
+                     (new_df$z==3 & new_df$sum_sn>265),]
+
+  #Remove charge and sum channels
+  new_df <- new_df %>% select(-z) %>%
+    group_by(Protein_ID, Peptide) %>%
+    dplyr::summarise(across(where(is.numeric), \(x) sum(x)),
+                     .groups = "drop") %>%
+    as.data.frame()
+
+  #Mean center resulting data and change column names
+  new_df[cols] <- new_df[cols] / rowMeans(new_df[cols])
+  colnames(new_df)[3:11] <- paste0("T", seq(0,8))
+  
+  return(new_df) }
+
+GB_R1_Raw <- split_experiments(RTS_Set1, sn.cols[1:9])
+GB_R2_Raw <- split_experiments(RTS_Set1, sn.cols[10:18])
+GB_R3_Raw <- split_experiments(RTS_Set2, sn.cols[1:9])
+GB_R4_Raw <- split_experiments(RTS_Set2, sn.cols[10:18])
+
+head(GB_R1_Raw)
+
+```
+
+
+```{r Normalizing experiments based on correction factor }
+
+normalize_exp <- function(df, corr_factor) {
+
+  #Applying wide isolation correction factor to channels
+  ratio.df <- as.matrix(df[paste0("T", seq(0,8))])
+  corr.ratios <- sweep(ratio.df, 2, corr_factor, `/`)
+  corr.ratios <- sweep(corr.ratios, 1, rowMeans(corr.ratios), `/`)  
+    
+  df[paste0("T", seq(0,8))] <- corr.ratios
+  
+  return(df) }
+
+GB_R1_Norm <- normalize_exp(GB_R1_Raw, R1_Corr_Factor)
+GB_R2_Norm <- normalize_exp(GB_R2_Raw, R2_Corr_Factor)
+GB_R3_Norm <- normalize_exp(GB_R3_Raw, R3_Corr_Factor)
+GB_R4_Norm <- normalize_exp(GB_R4_Raw, R4_Corr_Factor)
+
+```
+
+
+```{r Rolling up proteins based on signal }
+
+#Determining protein quant using weighted peptides based on signal
+protein_rollup <- function(df) {
+
+  roll_df <- lapply(unique(df$Protein_ID), function(x){
+
+    sub_df <- df[df$Protein_ID == x,]
+    sub_df["Fraction"] <- sub_df$sum_sn / sum(sub_df$sum_sn)
+    sub_df[paste0("T", seq(0,8))] <- sub_df[paste0("T", seq(0,8))] * sub_df$Fraction
+    
+    out_df <- apply(sub_df[paste0("T", seq(0,8))], 2, sum)
+    out_df <- out_df / mean(out_df)
+    
+    out_df <- data.frame(t(out_df))
+    out_df <- cbind(data.frame(Protein_ID = sub_df[1,1]),
+                    out_df)
+
+    return(out_df) }) %>% bind_rows
+
+  return(roll_df) }
+
+#Gloria: PQ stands for Protein Quant
+GB_R1_PQ <- protein_rollup(GB_R1_Norm)
+GB_R2_PQ <- protein_rollup(GB_R2_Norm)
+GB_R3_PQ <- protein_rollup(GB_R3_Norm)
+GB_R4_PQ <- protein_rollup(GB_R4_Norm)
+
+head(GB_R1_PQ)
+
+```
+
+
+```{r Creatubg representative set }
+
+#Calculating median data for plot
+GB_AllReps_WI <- rbind(GB_R1_PQ, GB_R2_PQ, GB_R3_PQ, GB_R4_PQ) %>%
+  group_by(Protein_ID) %>%
+  dplyr::summarise(across(where(is.numeric), \(x) median(x)),
+                   .groups = "drop")
+
+#Recentering just in case
+GB_AllReps_WI[paste0("T", seq(0,8))] <- 
+  sweep(GB_AllReps_WI[paste0("T", seq(0,8))], 1,
+        rowMeans(GB_AllReps_WI[paste0("T", seq(0,8))]), `/`)  
+
+consistent_proteins <- intersect(intersect(GB_R1_PQ$Protein_ID, GB_R2_PQ$Protein_ID),
+                                 intersect(GB_R3_PQ$Protein_ID, GB_R4_PQ$Protein_ID))
+
+GB_AllReps_WI <- GB_AllReps_WI[GB_AllReps_WI$Protein_ID %in%
+                                 consistent_proteins,]
+head(GB_AllReps_WI)
+
+```
+
+
+```{r Data not normalized }
+
+#Gloria: DNU stands for Do Not Use (DNU)
+DNU_Raw1_PQ <- protein_rollup(GB_R1_Raw)
+DNU_Raw2_PQ <- protein_rollup(GB_R2_Raw)
+DNU_Raw3_PQ <- protein_rollup(GB_R3_Raw)
+DNU_Raw4_PQ <- protein_rollup(GB_R4_Raw)
+
+GB_AllReps_DNU <- rbind(DNU_Raw1_PQ, DNU_Raw2_PQ, DNU_Raw3_PQ, DNU_Raw4_PQ) %>%
+  group_by(Protein_ID) %>%
+  dplyr::summarise(across(where(is.numeric), \(x) median(x)),
+                   .groups = "drop")
+
+#Recentering just in case
+GB_AllReps_DNU[paste0("T", seq(0,8))] <- 
+  sweep(GB_AllReps_DNU[paste0("T", seq(0,8))], 1,
+        rowMeans(GB_AllReps_DNU[paste0("T", seq(0,8))]), `/`)  
+
+GB_AllReps_DNU <- GB_AllReps_DNU[GB_AllReps_DNU$Protein_ID %in%
+                                   consistent_proteins,]
+head(GB_AllReps_DNU)
+
+```
+
+
+```{r Exponential decay plots }
+
+exp_decay <- function(t_hrs, a, b) {
+  return(a * exp(-b * t_hrs)) }
+
+fit_yolk_trend <- function(df1, df2, df3, df4, med_df){
+
+  calc_yolk_vec <- function(df) {
+    yolk_med <- apply(df[df$Protein_ID %in% frog_yolk_set,2:10], 2, median)
+    yolk_med <- yolk_med / mean(yolk_med)    
+    return(yolk_med) }
+    
+  df1_yolk_med <- calc_yolk_vec(df1)
+  df2_yolk_med <- calc_yolk_vec(df2)
+  df3_yolk_med <- calc_yolk_vec(df3)
+  df4_yolk_med <- calc_yolk_vec(df4)  
+
+  # df1_yolk_med <- df1_yolk_med / df1_yolk_med[1]
+  # df2_yolk_med <- df2_yolk_med / df2_yolk_med[1]
+  # df3_yolk_med <- df3_yolk_med / df3_yolk_med[1]
+  # df4_yolk_med <- df4_yolk_med / df4_yolk_med[1]
+  
+  #---------------------------------------
+  
+  yolk_df <- data.frame(Time=rep(c((GB_timepoints + 176)/60), 4),
+                        Value=c(df1_yolk_med, df2_yolk_med,
+                                df3_yolk_med, df4_yolk_med),
+                        Exp=c(rep("T1", 9), rep("T2", 9),
+                              rep("T3", 9), rep("T4", 9)))
+
+  lin <- lm(log(Value) ~ Time, data = yolk_df, weights = yolk_df$Value^2)
+  a0 <- unname(exp(coef(lin)[1]))
+  b0 <- unname(-coef(lin)[2])
+
+  yolk_fit_nls <- nlsLM(Value ~ a * exp(-b * Time),
+                        data = yolk_df,
+                        start = list(a = a0, b = b0),
+                        lower = c(a=0, b=0))
+
+  smooth_fit <-
+    data.frame(Time = (GB_timepoints+176)/60)
+  smooth_fit["Predict"] <- exp_decay(smooth_fit$Time,
+                                     coef(yolk_fit_nls)['a'],
+                                     coef(yolk_fit_nls)['b'])
+
+  yolk_meds <- med_df[med_df$Protein_ID %in% frog_yolk_set,]
+  yolk_meds <- apply(yolk_meds[paste0("T", seq(0,8))], 2, median)
+
+  yolk_meds <- yolk_meds / mean(yolk_meds)
+  # yolk_meds <- yolk_meds / yolk_meds[1]
+  yolk_meds <- data.frame(Time = (GB_timepoints+176)/60,
+                          Values=yolk_meds)
+
+  p1 <- ggplot() +
+    geom_line(data=yolk_df, aes(x=Time, y=Value, group=Exp),
+              color="grey70", size=2, alpha=0.7) +
+    
+    # geom_line(data=yolk_meds,
+    #           aes(x=Time, y=Values, group=1),
+    #           color="#CC3333", size=3, alpha=0.7) +
+    
+    geom_line(data=yolk_meds,
+              aes(x=Time, y=Values, group=1),
+              color="#E69F00", size=3, alpha=0.7) +
+    geom_line(data=smooth_fit,
+              aes(x=Time, y=Predict, group=1),
+              color="purple", size=3, alpha=0.7) +
+    
+    geom_hline(yintercept = 1, linetype="dotted", linewidth=1.2, color="black") +
+    labs(x = "Hours post-fertilization", y = "Rel. abundance") +
+    theme_bw() +
+    theme(axis.text = element_text(size = 20, colour = "black"),
+          plot.title = element_text(size = 20, hjust = 0.5),
+          axis.title = element_text(size = 24),
+          aspect.ratio = 1,
+          legend.text = element_text(size=16),
+          legend.title = element_text(size=16),
+          panel.border = element_rect(linewidth = 2),
+          panel.grid.major = element_line(color = "grey70", linewidth = 0.25),
+          panel.grid.minor = element_line(color = "grey70", linewidth = 0.25),
+          plot.margin = margin(10, 15, 10, 15, unit = "pt")) +
+    coord_cartesian(ylim=c(0,1.5))
+   
+  print(p1)
+  
+  return(coef(yolk_fit_nls)) }
+
+# #Uncomment for new image!
+# tiff("graph.tiff", units="in",
+#      width=4.5, height=4.5, res=300)
+
+# fit_yolk_trend(DNU_Raw1_PQ, DNU_Raw2_PQ, DNU_Raw3_PQ, DNU_Raw4_PQ,
+#                GB_AllReps_DNU)
+yolk_fit_values <- fit_yolk_trend(GB_R1_PQ, GB_R2_PQ, GB_R3_PQ, GB_R4_PQ,
+                                  GB_AllReps_WI)
+
+# dev.off() #Uncomment for new image!
+
+```
+
+
+```{r Calculating correction factor for no-spinout dataset }
+
+generate_yolk_corr <- function(DNU_df, raw_df){
+  theory_median <- exp_decay((GB_timepoints+176)/60, yolk_fit_values['a'],
+                             yolk_fit_values['b'])
+  theory_median <- theory_median / mean(theory_median)
+  
+  raw_average <- DNU_df[DNU_df$Protein_ID %in% frog_yolk_set,]
+  raw_average <- apply(raw_average[2:10], 2, median)
+  raw_average <- raw_average / mean(raw_average)
+  
+  corr_factor <- raw_average / theory_median
+
+  yolk_norm <- raw_df
+  yolk_norm[3:11] <- sweep(raw_df[3:11], 2, corr_factor, `/`)
+  yolk_norm[3:11] <- sweep(yolk_norm[3:11], 1,
+                           rowMeans(yolk_norm[3:11]), `/`)
+
+  yolk_PQ <- protein_rollup(yolk_norm)
+  
+  return(yolk_PQ) }
+
+GB_R1_YolkPQ <- generate_yolk_corr(DNU_Raw1_PQ, GB_R1_Raw)
+GB_R2_YolkPQ <- generate_yolk_corr(DNU_Raw2_PQ, GB_R2_Raw)
+GB_R3_YolkPQ <- generate_yolk_corr(DNU_Raw3_PQ, GB_R3_Raw)
+GB_R4_YolkPQ <- generate_yolk_corr(DNU_Raw4_PQ, GB_R4_Raw)
+
+head(GB_R1_YolkPQ)
+
+```
+
+
+```{r}
+
+#Calculating median data for plot
+GB_YolkNorm_Merge <- rbind(GB_R1_YolkPQ, GB_R2_YolkPQ,
+                           GB_R3_YolkPQ, GB_R4_YolkPQ) %>%
+  group_by(Protein_ID) %>%
+  dplyr::summarise(across(where(is.numeric), \(x) median(x)),
+                   .groups = "drop")
+
+GB_YolkNorm_Merge[paste0("T", seq(0,8))] <- 
+  sweep(GB_YolkNorm_Merge[paste0("T", seq(0,8))], 1,
+        rowMeans(GB_YolkNorm_Merge[paste0("T", seq(0,8))]), `/`)  
+
+GB_YolkNorm_Merge <- GB_YolkNorm_Merge[GB_YolkNorm_Merge$Protein_ID %in%
+                                          consistent_proteins,]
+
+head(GB_YolkNorm_Merge)
+
+```
+
+
+```{r kmeans plots for each dataset }
+
+kmeans_plot <- function(data, time_lst, k=5, seed=123, order=seq(1,k,1)) {
+  
+  set.seed(seed)
+
+  data <- as.data.frame(data)
+  row.names(data) <- data$Protein_ID
+  data[c("Protein_ID")] <- NULL
+
+  # K-means clustering
+  km.all <- kmeans(data, centers = k)
+  
+  all.kresult <- as.data.frame(km.all$centers)
+  all.kresult["Cluster"] <- row.names(all.kresult)
+  all.kresult["Size"] <- km.all$size
+  row.names(all.kresult) <- NULL
+  
+  all.kresult <- all.kresult %>%
+    pivot_longer(cols = -c(Cluster, Size),
+                 names_to = "Time", values_to = "Value")
+
+  all.kresult["Time_Hrs"] <- 
+    rep(time_lst, nrow(all.kresult) / length(time_lst))  
+
+  plots <- lapply(seq_len(k), function(i){
+    sub_cl <- all.kresult[all.kresult$Cluster == i,]
+    # sub_cl["Value"] <- sub_cl$Value / sub_cl$Value[1]
+    
+    p1 <- ggplot() +
+      geom_line(data = sub_cl, aes(x = Time_Hrs, y = Value, group = 1),
+                linewidth = 3, color = "black") +
+      geom_hline(yintercept = 1, linetype = "dashed", linewidth = 1) +
+      theme_bw() +
+      labs(x = "", y = "Rel. Abundance",
+           title = unique(sub_cl$Size)) +
+      theme(axis.text = element_text(size = 18, colour = "black"),
+            plot.title = element_text(size = 18, hjust = 0.5),
+            axis.title = element_text(size = 22),
+            axis.title.y = element_blank(),
+            aspect.ratio = 1,
+            panel.border = element_rect(linewidth = 2),
+            legend.position = "none",
+            panel.grid.major = element_line(color = "grey70", linewidth = 0.25),
+            panel.grid.minor = element_line(color = "grey70", linewidth = 0.25)) +
+      coord_cartesian(ylim = c(0, 3))
+    
+    return(p1) })
+  
+  # Combine all plots with patchwork
+  combined_plot <- Reduce(`|`, plots[order])
+  
+  print(combined_plot)
+  
+  out.clusters <- data.frame(Protein_ID = names(km.all$cluster),
+                             Cluster = km.all$cluster)
+  row.names(out.clusters) <- NULL
+
+  return(out.clusters) }  
+  
+
+# #Uncomment for new image!
+# tiff("graph.tiff", units="in",
+#      width=10, height=4, res=300)
+
+yolk_kmeans <- kmeans_plot(GB_YolkNorm_Merge,
+                           time_lst=(GB_timepoints+176)/60,
+                           order=c(4,3,1,5,2))
+
+# dev.off() #Uncomment for new image!
+
+```
+
+
+```{r Test proteins }
+
+fk_fit_proteins <- yolk_kmeans[yolk_kmeans$Cluster %in% c(4,2),]$Protein_ID
+
+cat("FK Fit Proteins: ", length(fk_fit_proteins), "\n\n")
+fk_fit_proteins[1:5]
+
+```
+
+
+```{r Stable proteins to be tested }
+
+external_norm_set <- yolk_kmeans[yolk_kmeans$Cluster == 4,]$Protein_ID
+
+external_norm_set <- sapply(external_norm_set, function(x){
+  
+  all_values <- as.numeric(GB_YolkNorm_Merge[GB_YolkNorm_Merge$Protein_ID == x,2:10])
+  max_change <- max(all_values)/min(all_values)
+  
+  if (max_change < 1.2 & max_change > 0.8) {
+    return(x) }
+  else { return(NA) }}, USE.NAMES = FALSE)
+
+external_norm_set <- external_norm_set[!is.na(external_norm_set)]
+
+cat("Potential Stable Proteins: ", length(external_norm_set), "\n\n")
+external_norm_set[1:5]
+
+```
+
+
+```{r Importing label-free data }
+
+filter_lblf_data <- function(data.df) {
+
+  data.df["Protein.ID"] <- #Reorganizing order of IDs to match T8 search
+    paste0(sapply(strsplit(data.df$`Protein.ID`, split = "\\|"), "[", 3), "|",
+           sapply(strsplit(data.df$`Protein.ID`, split = "\\|"), "[", 2)) 
+
+  data.df <- data.df[data.df$Parsimony %in% c("U"),] #Drop NA Parsimony
+  data.df <- data.df[!grepl("#", data.df$`Protein.ID`),] #Remove reverse sequences
+  data.df <- data.df[!grepl('contaminant', data.df$`Protein.ID`),] #Remove contaminants
+  data.df <- data.df[!grepl("\\*", data.df$`Trimmed.Peptide`),] #Remove oxM
+
+  #Remove peptides with missed cleavages
+  # ... Contains KR after removing last AA
+  data.df <- data.df[!(grepl("K",
+                        str_sub(data.df$`Trimmed.Peptide`, end=-2))),]
+  data.df <- data.df[!(grepl("R",
+                        str_sub(data.df$`Trimmed.Peptide`, end=-2))),]
+
+  #Max signal within peptide group
+  data.df <- data.df %>% group_by(`Trimmed.Peptide`) %>%
+    slice_max(`Sum.S.N`, with_ties = FALSE) %>%
+    ungroup
+
+  data.df <- data.df[c('Protein.ID', 'Trimmed.Peptide', "z",
+                       'ScanF', "Parent.Scan", "Isolation.m.z", "Theo.m.z",
+                       paste("Max.Sn.M", seq(0,90,1), sep=""))]
+                       # paste("Area.M", seq(0,90,1), sep=""))]
+
+  data.df <- data.df[data.df$`Max.Sn.M0` > 20 &
+                       data.df$`Max.Sn.M1` > 20 , ]
+  
+  return(data.df) }
+
+T5_O12_lblfree <- read.csv("Data/XLA_O18/LabelFree/ORC_05461_XLA-O18-T5_LabelFree_O12.csv")
+T5_O12_lblfree <- filter_lblf_data(T5_O12_lblfree)
+
+head(T5_O12_lblfree)
+
+```
+
+
+```{r Functions to calculate all light formula }
+
+# Amino acid residue compositions (no terminal groups)
+aa_composition <- list(
+  A = c(C=3, H=5, N=1, O=1, S=0),
+  V = c(C=5, H=9, N=1, O=1, S=0),
+  I = c(C=6, H=11, N=1, O=1, S=0),
+  L = c(C=6, H=11, N=1, O=1, S=0),
+  M = c(C=5, H=9, N=1, O=1, S=1),  
+  F = c(C=9, H=9, N=1, O=1, S=0),
+  Y = c(C=9, H=9, N=1, O=2, S=0),  
+  W = c(C=11, H=10, N=2, O=1, S=0),
+  C = c(C=3, H=5, N=1, O=1, S=1),  
+  G = c(C=2, H=3, N=1, O=1, S=0),  
+  P = c(C=5, H=7, N=1, O=1, S=0),
+  S = c(C=3, H=5, N=1, O=2, S=0),
+  T = c(C=4, H=7, N=1, O=2, S=0),
+  N = c(C=4, H=6, N=2, O=2, S=0),
+  Q = c(C=5, H=8, N=2, O=2, S=0),  
+  H = c(C=6, H=7, N=3, O=1, S=0),  
+  #Can consider adding +1H if problems arise
+  R = c(C=6, H=12, N=4, O=1, S=0),
+  K = c(C=6, H=12, N=2, O=1, S=0),  
+  #Can consider subtracting -1H if problems arise  
+  D = c(C=4, H=5, N=1, O=3, S=0),
+  E = c(C=5, H=7, N=1, O=3, S=0))
+
+
+get_light_formula <- function(sequence, charge) {
+  total <- c(C=0, H=0, N=0, O=0, S=0)
+  total_O <- 0
+  
+  for (aa in strsplit(sequence, "")[[1]]) {
+    total <- total + aa_composition[[aa]] 
+    
+    if (aa == "C") {
+      # Add NEM modification per cysteine
+      total["C"] <- total["C"] + 6
+      total["H"] <- total["H"] + 7
+      total["N"] <- total["N"] + 1
+      total["O"] <- total["O"] + 2 }    
+    
+    }
+  
+  # Add terminal H2O
+  total["H"] <- total["H"] + 2
+  total["O"] <- total["O"] + 1
+  
+  # Add proton(s) for charged ion
+  total["H"] <- total["H"] + charge
+
+  return(total) }
+
+data("isotopes")
+
+```
+
+
+```{r Function to convolve spectra and readout at Orbitrap 120k MS1 }
+
+convolve_spectra <- function(iso_df, theo_mz, mz_max) {
+  
+  #kwargs - Orbitrap @120k MS1
+  resolution_at_200 <- 120000
+  step=0.0005
+  
+  #Orbitrap resolution decreases with sqrt(m/z)
+  Res <- resolution_at_200 * sqrt(200 / theo_mz) #Resolution
+  fwhm <- theo_mz / Res #full width at half maximum
+  sigma <- fwhm / (2*sqrt(2*log(2))) #Deviation for Gaussian dist.
+    
+  #Calulate range and creating empty vector for convolving
+  mz_min <- theo_mz - 1
+  mz_max <- mz_max + 1
+  mz_grid <- seq(mz_min, mz_max, by = step)
+  smooth_abundance <- numeric(length(mz_grid))
+  
+  for (i in seq_len(nrow(iso_df))) {
+    #Loop each m/z and intensity
+    mz <- iso_df$`m/z`[i]
+    intensity <- iso_df$abundance[i]
+    
+    #Generate gaussian distribution assuming:
+    # ... a mean at m/z with sigma from resolution
+    peak_dist <- intensity * dnorm(mz_grid, mean = mz, sd = sigma)
+    smooth_abundance <- smooth_abundance +
+      intensity * dnorm(mz_grid, mean = mz, sd = sigma) #Combine for all m/z
+  }
+  
+  #Normalize maximum to 100 and convert to dataframe
+  smooth_abundance <- 100 * smooth_abundance / max(smooth_abundance)
+  gaus_convolved <- data.frame(mz = mz_grid, abundance = smooth_abundance)  
+
+  return(gaus_convolved) }
+
+```
+
+
+```{r Matrices for convolution }
+
+# Class A: no side-chain O (m=2, s=1): R in {0,1}, k in {0,1,2}
+# rows = k, cols = R
+M_A <- matrix(c(
+  1,   0,    # k=0
+  1/2, 1/2,  # k=1
+  0,   1     # k=2
+), nrow=3, byrow=TRUE)
+
+# Class B: one side-chain O (S,N,Q) (m=3, s=2): R in {0,1,2}, k in {0..3}
+M_B <- matrix(c(
+  1,   0,   0,   # k=0
+  1/3, 2/3, 0,   # k=1
+  0,   2/3, 1/3, # k=2
+  0,   0,   1    # k=3
+), nrow=4, byrow=TRUE)
+
+# Class C: two side-chain O (D,E) (m=4, s=3): R in {0,1,2,3}, k in {0..4}
+M_C <- matrix(c(
+  1,   0,   0,   0,   # k=0
+  1/4, 3/4, 0,   0,   # k=1
+  0,   1/2, 1/2, 0,   # k=2
+  0,   0,   3/4, 1/4, # k=3
+  0,   0,   0,   1    # k=4
+), nrow=5, byrow=TRUE)
+
+```
+
+
+```{r AA data for frog }
+
+XLA_AA_df <- read.csv("Data/XLA_O18/Isotopic_Envelopes/Frog_Early_AA_Matrix.csv")
+
+fk_map <- list(
+  X = as.numeric(XLA_AA_df[XLA_AA_df$AA=="X" &
+                             XLA_AA_df$Sample=="col009b_T8",
+                c("C12.PARENT", "O18.label.1", "O18.label.2")]),
+  U = as.numeric(XLA_AA_df[XLA_AA_df$AA=="U" &
+                        XLA_AA_df$Sample=="col009b_T8",
+                c("C12.PARENT", "O18.label.1", "O18.label.2", "O18.label.3")]),
+  Z = as.numeric(XLA_AA_df[XLA_AA_df$AA=="Z" &
+                        XLA_AA_df$Sample=="col009b_T8",
+                c("C12.PARENT", "O18.label.1", "O18.label.2",
+                  "O18.label.3", "O18.label.4")])
+)
+
+fk_map
+
+```
+
+
+```{r Functions to calculate shift from O18 labeling }
+
+ms_for_residue <- function(aa) {
+  classA <- c("R","H","K","C","G","P","A","V",
+              "I","L","M","F","W","T","Y") # per essential rule
+  classB <- c("S","N","Q")
+  classC <- c("D","E")
+  if (aa %in% classA) return("X")
+  if (aa %in% classB) return("U")
+  if (aa %in% classC) return("Z")
+  stop(sprintf("Unknown residue %s", aa))
+}
+
+matrix_for_class <- function(residue){
+  switch(ms_for_residue(residue), X=M_A, U=M_B, Z=M_C)
+} 
+
+
+PR_of_residue <- function(aa, aa_map) {
+  M  <- matrix_for_class(aa)                 # M_A / M_B / M_C
+  fk <- aa_map[[ ms_for_residue(aa) ]]       # class-median f_k
+  pr <- as.numeric(fk %*% M)                 # row-vector times matrix
+  pr / sum(pr)                               # safety normalize
+}
+
+
+peptide_PR <- function(seq, aa_map) {
+  aas <- strsplit(seq, "")[[1]] #Split peptide sequence
+  #Assign first probabilities to K to begin convolution
+  K <- PR_of_residue(aas[1], aa_map)
+
+  for (aa in aas[-1]) {
+    # base::convolve does correlation by default, so we reverse b
+    K <- convolve(K, rev( PR_of_residue(aa, aa_map) ), type = "open")
+  }
+
+  K / sum(K) }
+
+peptide_PR("PEPTIDE", fk_map)
+
+```
+
+
+```{r Functions to combine spectrums together }
+
+mix_labeled_envelope <- function(env_nat, Kdist, z, delta_neutral = 2.004245) {
+  delta_mz <- delta_neutral / z #m/z delta for each oxygen (dependent on charge)
+  out <- NULL #Initialize empty object
+  for (K in 0:(length(Kdist)-1)) { #kdist has length +1 because it includes 0
+    shifted <- env_nat #Copy of starting natural positions
+    
+    #Shift m/z axis by K * (mass shift per label)
+    shifted$mz <- shifted$mz + K * delta_mz 
+    
+    #Kdist[K+1] is P(K), the probability of having K heavy oxygens
+    # ... We shifted k back for math, but need +1 for R indexing
+    shifted$abundance <- shifted$abundance * Kdist[K+1]
+    
+    #Probabilities are rbinded to be able to aggregate
+    out <- if (is.null(out)) shifted else rbind(out, shifted)
+  }
+  
+  #Adds identical m/z and rescale so tallest peak is 100
+  agg <- aggregate(abundance ~ mz, data = out, sum)
+  agg$abundance <- 100 * agg$abundance / max(agg$abundance)
+  agg
+}
+
+
+combine_envelopes <- function(start_envelope, label_envelope,
+                              start_fraction, end_fraction) {
+  
+  start_pro <- start_envelope
+  start_pro["abundance"] <- start_pro$abundance * start_fraction
+
+  label_pro <- label_envelope
+  label_pro["abundance"] <- label_pro$abundance * end_fraction  
+    
+  final_envelope <- rbind(start_pro, label_pro)
+  final_envelope <- aggregate(abundance ~ mz, data = final_envelope, sum)
+  
+  final_envelope$abundance <- 100 * final_envelope$abundance / max(final_envelope$abundance)
+  final_envelope  
+}
+
+```
+
+
+```{r Function to simulate GFY/Orbitrap peak picking }
+
+peak_picker <- function(conv_df, start_mz, charge,
+                        step_Da = 1.002123, win_ppm = 10) {
+  step_mz = step_Da / charge
+  
+  # Ensure ascending by m/z
+  conv_df <- conv_df[order(conv_df$mz), ]
+  max_mz  <- max(conv_df$mz, na.rm = TRUE)
+
+  picked_mz <- numeric(0)
+  picked_I  <- numeric(0)
+
+  seed <- start_mz
+
+  # Step until run past the last m/z in the data
+  while (seed <= max_mz) {
+    # ±ppm window around the current target m/z ("seed")
+    tol <- seed * win_ppm * 1e-6
+
+    # Indices of points inside the window
+    idx <- which(conv_df$mz >= (seed - tol) & conv_df$mz <= (seed + tol))
+
+    if (length(idx) > 0) {
+      # Take the apex (highest intensity) within the window
+      sub_mz <- conv_df$mz[idx]
+      sub_I  <- conv_df$abundance[idx]
+      j      <- which.max(sub_I) 
+  
+      picked_mz <- c(picked_mz, sub_mz[j])
+      picked_I  <- c(picked_I,  sub_I[j])
+    }
+
+    # Advance the target by the fixed step
+    seed <- seed + step_mz
+  }
+  
+  # Return exactly what’s in the data, no normalization
+  data.frame(
+    idx = paste0("M", seq_along(picked_mz) - 1),
+    mz  = picked_mz,
+    intensity = picked_I
+  )
+}
+
+```
+
+
+```{r Shifting fk map to sit on lbl free data }
+
+shift_right_accumulate <- function(v, p = 0.05) {
+  n <- length(v)
+
+  out <- v * (1 - p)         # everyone keeps (1-p) of themselves...
+  if (n > 1) out[2:n] <- out[2:n] + p * v[1:(n-1)]  # ...and gets p from left
+  out[n] <- v[n] + p * v[n-1]  # last bin keeps 100% of itself + p% from left
+
+  out <- out / sum(out)
+  out
+}
+
+shift_left_accumulate <- function(v, p = 0.05) {
+  n <- length(v)
+  
+  out <- v * (1 - p)   # everyone keeps (1 - p) of themselves
+  if (n > 1) {
+    out[1:(n-1)] <- out[1:(n-1)] + p * v[2:n] }  # gets p from right
+  out[1] <- v[1] + p * v[2] # first bin keeps 100% of itself + p from right
+
+  out <- out / sum(out)
+  out }
+
+fk_optim_shift <- lapply(fk_map, shift_left_accumulate, p = 0.26)
+
+```
+
+
+```{r Optimizer for estimating synthesis }
+
+library(parallel)
+num_cores <- detectCores() - 1
+
+#You should parallelize this function -> extremely slow and I'm done writing this script
+envelope_fit_optim <- function(l_frac, ss_start_env, ss_lbl_env,
+                               theo_mz, pep_z, obs_peaks) {
+  heavy_synthesized <- 1 - l_frac
+
+  #Final merged envelope based on optimizer l_frac
+  merged_envelope <- combine_envelopes(ss_start_env, ss_lbl_env,
+                                       l_frac, heavy_synthesized)
+  
+  #Simulating GFY's peak picking method
+  late_shift_peaks <- peak_picker(merged_envelope, theo_mz, pep_z)
+  late_shift_peaks["intensity"] <- late_shift_peaks$intensity / 
+    max(late_shift_peaks$intensity) * 100 #Normalize to max 100
+
+  #Combining predicted and observed data  
+  l_peak_comparison <- merge(late_shift_peaks, obs_peaks,
+                           by="idx", all.x=TRUE,
+                           suffixes=c("_Pred", "_Obs")) %>% arrange(mz)
+  
+  theo_data <- as.numeric(l_peak_comparison$intensity_Pred)
+  obs_data <- as.numeric(l_peak_comparison$intensity_Obs)
+
+  rss <- (theo_data - obs_data)**2
+  rss <- sum(rss)
+  
+  return(rss) }
+
+```
+
+
+```{r Fitting function }
+
+estimate_synthesis <- function(row, pred_fk_map) {
+  
+  #------------ Start Prediction ------------------
+  
+  #Setting peptide sequence, charge, and theoretical m/z
+  protein_id <- as.character(row["Protein.ID"])
+  peptide_sequence <- row["Trimmed.Peptide"] %>% as.character
+  pep_z <- row["z"] %>% as.numeric
+  theo_mz <- row["Theo.m.z"] %>% as.numeric
+
+  plot_title <- paste0("Peptide: ", peptide_sequence)
+
+  #Calculating atomic formula and removing unnecessary items    
+  named_atomic_vec <- get_light_formula(peptide_sequence, pep_z)
+  named_atomic_vec <- named_atomic_vec[named_atomic_vec > 0] #Removing unneeded
+
+  #Collapse into formula for enviPat::isopattern() from
+  formula <- paste0(names(named_atomic_vec), named_atomic_vec,
+                    collapse = "")
+
+  #Calculate formula assuming infinitely possible resolution at ~ 1% threshold
+  start_prediction <- suppressMessages( #Suppressing annoying message
+    isopattern(isotopes, chemforms = formula,
+               threshold = 0.01, charge = pep_z)[[1]] )
+  start_prediction <- as.data.frame(start_prediction)
+  
+  #Convolving spectra assuming gaussian peaks
+  start_envelope <- convolve_spectra(start_prediction, theo_mz,
+                                     max(start_prediction$`m/z`))
+  
+  #------------ Label Prediction ------------------  
+
+  #Calculating k probability distirbutions based on peptide sequence  
+  K_label_shifted <- peptide_PR(peptide_sequence, pred_fk_map)
+  
+  #Shifting starting envelope based on weighted probabilities
+  labeled_envelope <- mix_labeled_envelope(start_envelope, K_label_shifted,
+                                           z = pep_z)
+
+  #------------ Synthesis Prediction ------------------          
+
+  #Data from file
+  measured_DDA <- row[grepl("Max.Sn", names(row))]
+  measured_DDA <- data.frame(idx=gsub("Max.Sn.", "", names(measured_DDA)),
+                             intensity = as.numeric(measured_DDA))
+
+  #Normalizing observed data such that maximum is 100 similar to predictions
+  measured_DDA$intensity <- 100 * measured_DDA$intensity / max(measured_DDA$intensity)
+  
+  #This returns the fraction of light based on optimizing the observed data  
+  synthesis_pred <- optimize(f=envelope_fit_optim, interval = c(0, 1),
+                             ss_start_env = start_envelope,
+                             ss_lbl_env = labeled_envelope,
+                             theo_mz = theo_mz, pep_z = pep_z,
+                             obs_peaks = measured_DDA)
+  obj_error <- synthesis_pred$objective
+  
+  #------------ Visualization ------------------      
+    
+  light_remaining <- synthesis_pred$minimum
+  heavy_synthesized <- 1 - light_remaining
+
+  #Final merged envelope based on fitting
+  merged_envelope <- combine_envelopes(start_envelope, labeled_envelope,
+                                       light_remaining, heavy_synthesized)
+  late_shift_peaks <- peak_picker(merged_envelope, theo_mz, pep_z)
+  late_shift_peaks["intensity"] <- late_shift_peaks$intensity /
+    max(late_shift_peaks$intensity) * 100
+
+  #Combining predicted and observed data  
+  l_peak_comparison <- merge(late_shift_peaks, measured_DDA,
+                             by="idx", all.x=TRUE,
+                             suffixes=c("_Pred", "_Obs")) %>% arrange(mz)  
+  l_peak_comparison["idx"] <- as.numeric(gsub("M", "", l_peak_comparison$idx))
+  
+  peaks_signal <- sum(l_peak_comparison$intensity_Obs)
+  
+  outline <- data.frame(Protein_ID=protein_id, Peptide=peptide_sequence,
+                        Signal=peaks_signal, Fit_Error = obj_error,
+                        LightF = light_remaining, HeavyF = heavy_synthesized)  
+  
+  return(outline) }
+
+#Setup cluster
+cl <- makeCluster(num_cores)
+
+#Export necessary variables/functions to the cluster nodes
+clusterExport(cl,
+              varlist=c("fk_optim_shift", "get_light_formula", "aa_composition",
+                        "isotopes", "convolve_spectra", "peptide_PR",
+                        "PR_of_residue", "matrix_for_class", "M_A", "M_B",
+                        "M_C", "ms_for_residue", "mix_labeled_envelope",
+                        "combine_envelopes", "envelope_fit_optim",
+                        "peak_picker", "estimate_synthesis"))
+invisible(clusterEvalQ(cl, library(enviPat)))
+invisible(clusterEvalQ(cl, library(dplyr)))
+invisible(clusterEvalQ(cl, library(ggplot2)))
+
+norm_set_synthesis <- T5_O12_lblfree[T5_O12_lblfree$Protein.ID %in% external_norm_set,]
+norm_set_synthesis <- parApply(cl, norm_set_synthesis, 1,
+                               function(x){ estimate_synthesis(x, fk_optim_shift) })
+norm_set_synthesis <- norm_set_synthesis %>% bind_rows
+norm_set_synthesis <- norm_set_synthesis[!is.na(norm_set_synthesis$Signal),] %>%
+  arrange(HeavyF)
+
+write.csv(norm_set_synthesis, "Data/XLA_Norm/final_frog_synthesis_calc.csv",
+          row.names = FALSE)
+
+# Importing when not trying to rerun section above
+# norm_set_synthesis <- read.csv("Data/XLA_Norm/050526_final_frog_synthesis_calc.csv")
+
+stopCluster(cl) #Stop Cluster
+
+```
+
+
+```{r Synthesis fit distribution }
+
+p1 <- ggplot(norm_set_synthesis, aes(x = HeavyF)) +
+
+  geom_histogram(
+    aes(fill = after_stat(xmax <= .01)),
+    binwidth = .01,
+    boundary = 0,
+    color = "black"
+  ) +
+
+  scale_fill_manual(
+    values = c("TRUE" = "grey40",
+               "FALSE" = "grey90"),
+    guide = "none"
+  ) +
+  labs(x="Mixing coefficient of two-envelope model (f)", y="Peptides") +
+  theme_bw() +
+  theme(axis.text=element_text(size=21,colour="black"),
+        plot.title = element_text(size=24, hjust=0.5),
+        axis.title = element_text(size=22),
+        panel.border = element_rect(linewidth=1.5),
+        panel.grid.major = element_line(color = "grey90", linewidth = 0.25),
+        panel.grid.minor = element_line(color = "grey90", linewidth = 0.25),
+        legend.position = "none",
+        plot.margin = margin(t = 10, r = 25, b = 10,
+                             l = 10, unit = "pt"))
+  
+length(unique(norm_set_synthesis[norm_set_synthesis$HeavyF < 0.01,]$Protein_ID))
+
+# #Uncomment for new image!
+# tiff("graph.tiff", units="in",
+#      width=5, height=3, res=300)
+
+p1
+
+# dev.off() #Uncomment for new image!
+
+```
+
+
+```{r Prediction visualization }
+
+visualize_predictions <- function(row, pred_fk_map) {
+  
+  #------------ Start Prediction ------------------
+  
+  #Setting peptide sequence, charge, and theoretical m/z
+  protein_id <- as.character(row["Protein.ID"])
+  peptide_sequence <- row["Trimmed.Peptide"] %>% as.character
+  pep_z <- row["z"] %>% as.numeric
+  theo_mz <- row["Theo.m.z"] %>% as.numeric
+
+  plot_title <- paste0("Pep: ", peptide_sequence)
+
+  #Calculating atomic formula and removing unnecessary items    
+  named_atomic_vec <- get_light_formula(peptide_sequence, pep_z)
+  named_atomic_vec <- named_atomic_vec[named_atomic_vec > 0] #Removing unneeded
+
+  #Collapse into formula for enviPat::isopattern() from
+  formula <- paste0(names(named_atomic_vec), named_atomic_vec,
+                    collapse = "")
+
+  #Calculate formula assuming infinitely possible resolution at ~ 1% threshold
+  start_prediction <- suppressMessages( #Suppressing annoying message
+    isopattern(isotopes, chemforms = formula,
+               threshold = 0.01, charge = pep_z)[[1]] )
+  start_prediction <- as.data.frame(start_prediction)
+  
+  #Convolving spectra assuming gaussian peaks
+  start_envelope <- convolve_spectra(start_prediction, theo_mz,
+                                     max(start_prediction$`m/z`))
+  
+  #------------ Label Prediction ------------------  
+
+  #Calculating k probability distirbutions based on peptide sequence  
+  K_label_shifted <- peptide_PR(peptide_sequence, pred_fk_map)
+  
+  #Shifting starting envelope based on weighted probabilities
+  labeled_envelope <- mix_labeled_envelope(start_envelope, K_label_shifted,
+                                           z = pep_z)
+
+  #------------ Synthesis Prediction ------------------          
+
+  #Data from file
+  measured_DDA <- row[grepl("Max.Sn", names(row))]
+  measured_DDA <- data.frame(idx=gsub("Max.Sn.", "", names(measured_DDA)),
+                             intensity = as.numeric(measured_DDA))
+
+  #Normalizing observed data such that maximum is 100 similar to predictions
+  measured_DDA$intensity <- 100 * measured_DDA$intensity / max(measured_DDA$intensity)
+  
+  #This returns the fraction of light based on optimizing the observed data  
+  synthesis_pred <- optimize(f=envelope_fit_optim, interval = c(0, 1),
+                             ss_start_env = start_envelope,
+                             ss_lbl_env = labeled_envelope,
+                             theo_mz = theo_mz, pep_z = pep_z,
+                             obs_peaks = measured_DDA)
+
+  #------------ Visualization ------------------      
+    
+  light_remaining <- synthesis_pred$minimum
+  heavy_synthesized <- 1 - light_remaining
+
+  #Final merged envelope based on fitting
+  merged_envelope <- combine_envelopes(start_envelope, labeled_envelope,
+                                       light_remaining, heavy_synthesized)
+  late_shift_peaks <- peak_picker(merged_envelope, theo_mz, pep_z)
+  late_shift_peaks["intensity"] <- late_shift_peaks$intensity /
+    max(late_shift_peaks$intensity) * 100
+
+  #Combining predicted and observed data  
+  l_peak_comparison <- merge(late_shift_peaks, measured_DDA,
+                             by="idx", all.x=TRUE,
+                             suffixes=c("_Pred", "_Obs")) %>% arrange(mz)  
+  l_peak_comparison["idx"] <- as.numeric(gsub("M", "", l_peak_comparison$idx))
+  
+  plot_title <- paste0(plot_title, "<br>*f* = ", round(heavy_synthesized, 2))
+  
+  p1 <- ggplot() +
+    geom_bar(data = l_peak_comparison, aes(x=idx, y=intensity_Obs),
+             stat="identity", fill="#009E73", alpha=0.6, color="black") +
+    geom_bar(data = l_peak_comparison, aes(x=idx, y=intensity_Pred),
+             fill="#F0E442", alpha=0.6, stat="identity", color="black") +
+    labs(y="Norm. abundance", x="MS1 peak", title=plot_title) +
+    theme_bw() +
+    theme(axis.text= element_text(size=20,colour="black"),
+          plot.title = element_markdown(size = 18, hjust = 0.5),
+          axis.title= element_text(size=20,colour="black"),          
+          panel.border = element_rect(linewidth=1),
+          panel.grid.major = element_line(color = "grey90", linewidth = 0.25),
+          panel.grid.minor = element_line(color = "grey90", linewidth = 0.25),
+          legend.position = "none",
+          plot.margin = margin(t = 10, r = 25, b = 10,
+                               l = 10, unit = "pt")) +
+    coord_cartesian(xlim=c(-1,51)) +
+    scale_x_continuous(
+      breaks = c(0, 10, 20, 30, 40, 50),
+      labels = c("M0", "M10", "M20", "M30", "M40", "M50"))
+    
+  return(p1) }
+
+example_df <- T5_O12_lblfree[T5_O12_lblfree$Trimmed.Peptide %in%
+                                  c("GFGFVTFENVDDAK", "STNPGISIGDIAK",
+                                    "IITMLPSSANAVEAYSGSNGILK",
+                                    "VVEIAPAAQLDPQLR"),]
+
+example_plots <- apply(example_df, 1,
+                       function(x){ visualize_predictions(x, fk_optim_shift) })
+example_plots
+
+```
+
+
+```{r Example Plots of some fitted envelopes for Supp. }
+
+plot_env_proteins <- function(protein_id) {
+  
+  plot_df <- GB_YolkNorm_Merge[GB_YolkNorm_Merge$Protein_ID == protein_id,]
+  # plot_df[2:10] <- plot_df[2:10] / plot_df[[2]]
+
+  plot_df <- plot_df %>% pivot_longer(cols = -Protein_ID)
+  plot_df["Time"] <- rep((GB_timepoints+176)/60, length(set))
+  
+  p1 <- ggplot() +
+    geom_line(data=plot_df, aes(x=Time, y=value, group=1),
+              linewidth=3) +
+    geom_hline(yintercept = 1, linetype = "dashed", size = 1) + 
+    labs(y="Rel. abundance", x="Hours post-fertilization",
+         title=protein_id) +
+    theme_bw() +
+    theme(axis.text= element_text(size=20,colour="black"),
+          plot.title = element_text(size=18, vjust=0.5, hjust=0.5),
+          axis.title= element_text(size=20,colour="black"),
+          panel.border = element_rect(linewidth=1),
+          aspect.ratio=1,
+          panel.grid.major = element_line(color = "grey90", linewidth = 0.25),
+          panel.grid.minor = element_line(color = "grey90", linewidth = 0.25),
+          legend.position = "none",
+          plot.margin = margin(t = 10, r = 25, b = 10,
+                               l = 10, unit = "pt")) +
+    coord_cartesian(ylim=c(0,3))
+
+  return(p1) }
+
+
+# #Uncomment for new image!
+# tiff("graph.tiff", units="in",
+#      width=9, height=4.5, res=300)
+
+plot_env_proteins(as.character(example_df[1,"Protein.ID"])) | example_plots[[1]]
+plot_env_proteins(as.character(example_df[3,"Protein.ID"])) | example_plots[[3]]
+plot_env_proteins(as.character(example_df[2,"Protein.ID"])) | example_plots[[2]]
+plot_env_proteins(as.character(example_df[4,"Protein.ID"])) | example_plots[[4]]
+
+# dev.off() #Uncomment for new image!
+
+```
+
+
+```{r Results of correction }
+
+stable_prot_corr <- function(DNU_df, raw_df, ref_proteins) {
+
+  flat_median <- DNU_df[DNU_df$Protein_ID %in% ref_proteins,]  
+  flat_median <- apply(flat_median[2:10], 2, median)
+  flat_median <- flat_median / mean(flat_median)
+
+  # flat_median <- raw_df[raw_df$Protein_ID %in% ref_proteins,]  
+  # flat_median <- apply(flat_median[3:11], 2, median)
+  # flat_median <- flat_median / mean(flat_median)
+  
+  final_norm <- raw_df
+
+  final_norm[3:11] <- sweep(final_norm[3:11], 2, flat_median, `/`)
+  final_norm[3:11] <- sweep(final_norm[3:11], 1,
+                           rowMeans(final_norm[3:11]), `/`)
+
+  final_PQ <- protein_rollup(final_norm)
+
+  return(final_PQ) }
+
+stable_proteins <- 
+  unique(norm_set_synthesis[norm_set_synthesis$HeavyF < 0.01,]$Protein_ID)
+
+GB_R1_Final_PQ <- stable_prot_corr(DNU_Raw1_PQ, GB_R1_Raw, stable_proteins)
+GB_R2_Final_PQ <- stable_prot_corr(DNU_Raw2_PQ, GB_R2_Raw, stable_proteins)
+GB_R3_Final_PQ <- stable_prot_corr(DNU_Raw3_PQ, GB_R3_Raw, stable_proteins)
+GB_R4_Final_PQ <- stable_prot_corr(DNU_Raw4_PQ, GB_R4_Raw, stable_proteins)
+
+head(GB_R1_Final_PQ)
+
+```
+
+
+```{r Determining median data based on new norm }
+
+#Calculating median data for plot
+GB_FinalNorm_Merge <- rbind(GB_R1_Final_PQ, GB_R2_Final_PQ,
+                            GB_R3_Final_PQ, GB_R4_Final_PQ) %>%
+  group_by(Protein_ID) %>%
+  dplyr::summarise(across(where(is.numeric), \(x) median(x)),
+                   .groups = "drop")
+
+GB_FinalNorm_Merge[paste0("T", seq(0,8))] <- 
+  sweep(GB_FinalNorm_Merge[paste0("T", seq(0,8))], 1,
+        rowMeans(GB_FinalNorm_Merge[paste0("T", seq(0,8))]), `/`)  
+
+head(GB_FinalNorm_Merge)
+
+```
+
+
+```{r Visualizing effects of different normalizations }
+
+plot_proteins <- function(set, data) {
+  
+  name_df <- data.frame(Protein_ID = set, XLA_Gene=names(set))
+  
+  plot_df <- data[data$Protein_ID %in% set,]
+  plot_df[2:10] <- plot_df[2:10] / plot_df[[2]]
+
+  plot_df <- plot_df %>% pivot_longer(cols = -Protein_ID)
+  plot_df["Time"] <- rep((GB_timepoints+176)/60, length(set))
+  
+  plot_df <- merge(name_df, plot_df, by="Protein_ID")
+  
+  p1 <- ggplot() +
+    geom_line(data=plot_df, aes(x=Time, y=value, group=XLA_Gene,
+                                color=XLA_Gene),
+              linewidth=1.5) +
+    geom_point(data=plot_df, aes(x=Time, y=value, color=XLA_Gene),
+               size=3) +
+    geom_hline(yintercept = 1, linetype = "dashed", size = 1) +    
+    theme_bw() +
+    labs(x = "Hours post-fertilization", y = "Rel. Abundance") +
+    theme(axis.text = element_text(size = 18, colour = "black"),
+          plot.title = element_text(size = 18, hjust = 0.5),
+          axis.title = element_text(size = 22),
+          aspect.ratio = 1,
+          legend.text = element_text(size=16),
+          legend.title = element_text(size=16),          
+          panel.border = element_rect(linewidth = 2),
+          panel.grid.major = element_line(color = "grey70", linewidth = 0.25),
+          panel.grid.minor = element_line(color = "grey70", linewidth = 0.25)) +
+    coord_cartesian(ylim=c(0,1.25))
+
+  return(p1) }
+
+plot_proteins(frog_yolk_set, GB_AllReps_DNU)
+plot_proteins(frog_yolk_set, GB_AllReps_WI)
+plot_proteins(frog_yolk_set, GB_YolkNorm_Merge)
+plot_proteins(frog_yolk_set, GB_FinalNorm_Merge)
+
+```
+
+
+```{r Output for other scripts }
+
+write.csv(data.frame(Protein_ID=stable_proteins),
+          "Data/XLA_Norm/XLA-O18_YolkNormSet_T8-NYS-Decay.csv",
+          row.names=FALSE)
+
+write.csv(GB_YolkNorm_Merge,
+          "Data/XLA_Norm/XLA-O18_GB-FinalDataset.csv",
+          row.names=FALSE)
+
+```
+
+
+```{r}
+
+sessionInfo()
+
+```
+

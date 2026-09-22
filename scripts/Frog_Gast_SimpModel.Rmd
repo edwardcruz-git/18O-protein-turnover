@@ -1,0 +1,1230 @@
+---
+title: "Frog Gast SimpModel"
+author: "Edward Cruz"
+date: "2026-06-09"
+output: github_document
+---
+
+
+```{r Libraries }
+
+rm(list=ls(all=T))
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(patchwork)
+library(minpack.lm)
+library(parallel)
+
+num_cores <- detectCores() - 1  # Save one core for system stability
+knitr::opts_chunk$set(fig.path = "figures/Frog_Gast_SimpModel/")
+
+```
+
+
+```{r Frog Annotations }
+
+human_map <- read.csv("Files/Reference/Xen10_to_Human_Name_Assign.csv")
+human_map["Protein_ID"] <- sapply(human_map$Protein_ID, function(x){
+  split_id <- strsplit(x, "\\|")[[1]]
+  reformat <- paste0(split_id[3], "|", split_id[2])
+
+  return(reformat) })
+
+protein_annotation <- human_map[c("Protein_ID", "Description")]
+human_map <- human_map[c("Protein_ID", "XLA_Gene", "Human_Gene")]
+
+frog_yolk_set <- c("XBmRNA35014|XBXL10_1g18990", "XBmRNA39801|XBXL10_1g21498",
+                   "XBmRNA35013|XBXL10_1g18989", "XBmRNA35012|XBXL10_1g18988",
+                   "XBmRNA67639|XBXL10_1g35803")
+names(frog_yolk_set) <- c("vtgb1.L", "vtgb1.S", "vtga1.L", "vtga2.L", "serpina")
+
+keratins <- human_map[grepl("KRT", human_map$Human_Gene),]$Protein_ID
+
+```
+
+
+```{r Importing Data }
+
+sn.cols <- c("126 Sn", "127n Sn", "127c Sn", "128n Sn", "128c Sn", "129n Sn",
+             "129c Sn", "130n Sn", "130c Sn", "131n Sn", "131c Sn", "132n Sn",
+             "132c Sn", "133n Sn", "133c Sn", "134n Sn", "134c Sn", "135n Sn")
+
+light.channels <- c("T0", "N2", "N4", "N6", "N8", "N10", "N11")
+heavy.channels <- c("T0", "O1", "O2", "O3", "O4", "O5",
+                    "O6", "O7", "O8", "O9", "O10", "O11")
+
+Frog_T9_all.min <- c(1472, 1502, 1535, 1592, 1714, 1832,
+                     2412, 2934, 3270, 3749, 4260, 4411) - 1472
+Frog_T9_light.min <- Frog_T9_all.min[c(1,3,5,7,9,11:12)]
+
+#We're run in parallel from different mothers
+avg_light_time <- Frog_T9_light.min
+avg_heavy_time <- Frog_T9_all.min
+
+#Files to normalize
+XLA_O18_T9  <- read.csv("Data/XLA_O18/XLA_O18-T9_Filtered_Data.csv")
+XLA_O18_T10  <- read.csv("Data/XLA_O18/XLA_O18-T10_Filtered_Data.csv")
+
+norm_set <- read.csv("Data/XLA_Norm/XLA-O18_YolkNormSet_T8-NYS-Decay.csv")$Protein_ID
+
+```
+
+
+```{r Minimum starting pool filter }
+
+#Removing things we can't say anything about -> human keratin contam. + frog spinout
+XLA_O18_T9 <- XLA_O18_T9[!XLA_O18_T9$Protein_ID %in% c(frog_yolk_set, keratins),]
+XLA_O18_T10 <- XLA_O18_T10[!XLA_O18_T10$Protein_ID %in% c(frog_yolk_set, keratins),]
+
+XLA_O18_T9 <- XLA_O18_T9[!rowSums(XLA_O18_T9[heavy.channels]) == 0,]
+XLA_O18_T10 <- XLA_O18_T10[!rowSums(XLA_O18_T10[heavy.channels]) == 0,]
+
+XLA_O18_T9["StartPool"] <- apply(XLA_O18_T9[heavy.channels], 1,
+      function(row){
+        starting_pool <- sum(row[c("T0", "O1")]) / sum(row)
+        return(starting_pool) })
+
+XLA_O18_T9["HeavyWeight"] <- apply(XLA_O18_T9[c(light.channels, heavy.channels)], 1,
+      function(row){
+
+        light_sn <- row[1:length(light.channels)]
+        heavy_sn <- row[(length(light.channels)+1):length(row)]
+        
+        return(mean(light_sn)/(mean(heavy_sn) + 1e-6)) })
+
+XLA_O18_T10["StartPool"] <- apply(XLA_O18_T10[heavy.channels], 1,
+      function(row){
+        starting_pool <- sum(row[c("T0", "O1")]) / sum(row)
+        return(starting_pool) })
+
+XLA_O18_T10["HeavyWeight"] <- apply(XLA_O18_T10[c(light.channels, heavy.channels)], 1,
+      function(row){
+
+        light_sn <- row[1:length(light.channels)]
+        heavy_sn <- row[(length(light.channels)+1):length(row)]
+        
+        return(mean(light_sn)/(mean(heavy_sn) + 1e-6)) })
+
+
+#This filter sets a floor to quantify based on signal
+# -> Requires (T0 + O1)/11 > 0.15
+# -> Requires heavy signal to not outweigh light signal
+XLA_O18_T9 <- XLA_O18_T9[(XLA_O18_T9$StartPool > 0.15) &
+                           (XLA_O18_T9$HeavyWeight > 0.8),]
+XLA_O18_T10 <- XLA_O18_T10[(XLA_O18_T10$StartPool > 0.15) &
+                             (XLA_O18_T10$HeavyWeight > 0.8),]
+
+```
+
+
+```{r Separating light vs. heavy channels }
+
+split_experiments <- function(df){
+  base_df <- df[c("Protein_ID", "Peptide", "Pep_k1", "Pep_k2")]
+
+  heavy_df <- df[heavy.channels]
+  heavy_df <- heavy_df/rowSums(heavy_df)
+  heavy_df <- heavy_df/rowMeans(heavy_df)
+  colnames(heavy_df)[1] <- c("T0_H")
+
+  light_df <- df[light.channels]
+  light_df <- light_df/rowSums(light_df)
+  light_df <- light_df/rowMeans(light_df)  
+  colnames(light_df)[1] <- c("T0_L")  
+  
+  split_df <- cbind(base_df, heavy_df, light_df,
+                    df[c("sum_sn", "StartPool", "HeavyWeight")])
+
+  return(split_df) }
+  
+XLA_O18_T9 <- split_experiments(XLA_O18_T9)
+XLA_O18_T10 <- split_experiments(XLA_O18_T10)
+
+light.channels <- c("T0_L", "N2", "N4", "N6", "N8", "N10", "N11")
+heavy.channels <- c("T0_H", "O1", "O2", "O3", "O4", "O5",
+                    "O6", "O7", "O8", "O9", "O10", "O11")
+
+```
+
+
+```{r Normalizing by stable set from NYS data }
+
+norm_Frog_split <- function(df, L_error, H_error) {
+  
+  L_error <- apply(df[df$Protein_ID %in% norm_set, light.channels],
+                   2, median)
+  L_error <- L_error / mean(L_error)
+  H_error <- apply(df[df$Protein_ID %in% norm_set, heavy.channels],
+                   2, median)
+  H_error <- H_error / mean(H_error)
+
+  print(c(L_error, H_error))
+  cat("\n")
+  #Divide each original ratio by the pipet error
+  # ... Divide each column by the row sum
+  H_ratio.df <- as.matrix(df[heavy.channels])
+  H_corr.ratios <- sweep(H_ratio.df, 2, H_error, `/`)
+  H_corr.ratios <- sweep(H_corr.ratios, 1, rowMeans(H_corr.ratios), `/`)
+
+  #Divide each original ratio by the pipet error
+  # ... Divide each column by the row sum
+  L_ratio.df <- as.matrix(df[light.channels])
+  L_corr.ratios <- sweep(L_ratio.df, 2, L_error, `/`)
+  L_corr.ratios <- sweep(L_corr.ratios, 1, rowMeans(L_corr.ratios), `/`)
+
+  #Normalized dataframe then shifting to 1 -> (1/18 Ratio) = 1
+  norm.df <- df
+  norm.df[heavy.channels] <- H_corr.ratios
+  norm.df[light.channels] <- L_corr.ratios
+
+  return(as.data.frame(norm.df)) }
+
+norm_T9.df <- norm_Frog_split(XLA_O18_T9, L_error_T9, H_error_T9)
+norm_T9.df <- norm_T9.df[norm_T9.df$T0_H > 0.8,]
+norm_T9.df <- norm_T9.df[norm_T9.df$T0_L > 0.15,]
+
+norm_T10.df <- norm_Frog_split(XLA_O18_T10, L_error_T10, H_error_T10)
+norm_T10.df <- norm_T10.df[norm_T10.df$T0_H > 0.8,]
+norm_T10.df <- norm_T10.df[norm_T10.df$T0_L > 0.15,]
+
+```
+
+
+```{r Calculating relevant peptide synthesis probabilities }
+
+# Determing where synthesis isn't relevant
+pep_decay_rate <- function(fraction, k1, k2) {
+  (-1 * log(fraction / k1)) / k2 }
+
+AA_peptide_cutoff <- function(row, l_time) {
+
+  pep_k1 <- as.numeric(row["Pep_k1"])
+  pep_k2 <- as.numeric(row["Pep_k2"])
+
+  #Trimming data to where below 10%
+  time_cutoff <- pep_decay_rate(0.1, pep_k1, pep_k2)
+  light_trim <- l_time[l_time < time_cutoff]
+
+  #If depletes too fast, then floor to minimum of 2
+  if (length(light_trim) < 2) { light_trim <- l_time[1:2] }
+
+  #Calculating real target decrease of AA probabilities
+  f_synth_calc <- exp(-pep_k2 * tail(light_trim, 1))
+
+  # Extend by one timepoint while f_synth is still above 10% 
+  while (f_synth_calc > 0.1 && length(light_trim) < length(l_time)) {
+    next_idx <- length(light_trim) + 1
+    light_trim <- l_time[1:next_idx]
+    f_synth_calc <- exp(-pep_k2 * tail(light_trim, 1)) }  
+
+  n_timepoints <- length(light_trim)
+
+  out_df <- data.frame(Peptide=row[1],
+                       Final_Prob=f_synth_calc,
+                       N_timepoints=n_timepoints)
+
+  return(out_df) }
+
+AA_pep_T9 <- norm_T9.df[c("Peptide", "Pep_k1", "Pep_k2")]
+AA_pep_T9 <- apply(AA_pep_T9, 1, function(x) {
+  AA_peptide_cutoff(x, Frog_T9_light.min)}) %>% bind_rows
+row.names(AA_pep_T9) <- NULL
+
+AA_pep_T10 <- norm_T10.df[c("Peptide", "Pep_k1", "Pep_k2")]
+AA_pep_T10 <- apply(AA_pep_T10, 1, function(x) {
+  AA_peptide_cutoff(x, Frog_T9_light.min)}) %>% bind_rows
+row.names(AA_pep_T10) <- NULL
+
+norm_T9.df <- merge(norm_T9.df, AA_pep_T9, by="Peptide")
+norm_T10.df <- merge(norm_T10.df, AA_pep_T10, by="Peptide")
+
+```
+
+
+```{r No baseline model }
+
+# Control channels: M0 approaches kt/kd asymptotically
+simple_normal_model <- function(t, m0_n, kd, kt) {
+  (kt / kd) + (m0_n - (kt / kd)) * exp(-kd * t) }
+
+# Heavy channels: original pool decays, synthesis contributes light peptide
+simple_heavy_model <- function(t, m0_h, kd, kt, k1, k2) {
+  m0_h * exp(-kd * t) + #Simplified model - no baseline
+    (kt * k1 / (kd - k2)) * (exp(-k2 * t) - exp(-kd * t)) }
+
+# Combined kt/kd fits for simplified model
+simple_pred_model <- function(t, heavy_ch, ctrl_ch, m0_heavy, m0_ctrl,
+                              kd, kt, pep_k1, pep_k2) {
+  
+  light_time <- tail(t, ctrl_ch)
+  heavy_time <- t[1:heavy_ch]
+
+  ctrl_pred <- simple_normal_model(light_time, m0_ctrl, kd, kt)
+  heavy_pred <- simple_heavy_model(heavy_time, m0_heavy, kd, kt,
+                                   pep_k1, pep_k2)
+
+  pred <- c(heavy_pred, ctrl_pred)
+  
+  return(pred) }
+
+```
+
+
+```{r Baseline model }
+
+# Control channel: two-pool model
+# Dynamic pool approaches kt/kd; stable pool sits at phi*m0_n
+twopool_normal_model <- function(t, m0_n, kd, kt, phi) {
+  dynamic <- (kt / kd) + ((1 - phi) * m0_n - (kt / kd)) * exp(-kd * t)
+  stable <- phi * m0_n
+  
+  dynamic + stable }
+
+# Heavy channel: two-pool model
+# Dynamic pool decays + synthesis adds light protein; stable pool sits at phi*m0_h
+twopool_heavy_model <- function(t, m0_h, kd, kt, k1, k2, phi) {
+  dynamic_decay <- (1 - phi) * m0_h * exp(-kd * t)
+  synthesis <- (kt * k1 / (kd - k2)) * (exp(-k2 * t) - exp(-kd * t))
+  stable <- phi * m0_h
+  
+  dynamic_decay + synthesis + stable }
+
+# Combined kt/kd fits for simplified model
+twopool_pred_model <- function(t, heavy_ch, ctrl_ch, m0_heavy, m0_ctrl,
+                               kd, kt, pep_k1, pep_k2, phi) {
+  
+  light_time <- tail(t, ctrl_ch)
+  heavy_time <- t[1:heavy_ch]
+
+  ctrl_pred <- twopool_normal_model(light_time, m0_ctrl, kd, kt, phi)
+  heavy_pred <- twopool_heavy_model(heavy_time, m0_heavy, kd, kt,
+                                    pep_k1, pep_k2, phi)
+
+  pred <- c(heavy_pred, ctrl_pred)
+  
+  return(pred) }
+
+```
+
+
+```{r Fitting proteins to two models - baseline vs. no baseline }
+
+peptide_fit <- function(row, l_time, h_time) {
+
+  #--- Model input ----------------------------  
+  
+  pep_k1 <- as.numeric(row["Pep_k1"])
+  pep_k2 <- as.numeric(row["Pep_k2"])
+
+  heavy_data <- as.numeric(row[heavy.channels])
+
+  light_cutoff <- as.numeric(row["N_timepoints"])
+  light_trim <- l_time[1:light_cutoff]
+  sub_light <- as.numeric(row[light.channels])[1:light_cutoff]
+  
+  #Input for nlsLM
+  all_data <- c(heavy_data, sub_light)  
+  all_time <- c(h_time, light_trim)
+
+  heavy_n <- length(all_time) - length(light_trim)
+  light_n <- length(light_trim)
+  
+  #--- Starting Guess ----------------------------  
+
+  #Starting channel parameters
+  m0_heavy_start <- heavy_data[1]
+  m0_ctrl_start <- sub_light[1]
+
+  #kD starting parameter 
+  se_heavy <- pmax(heavy_data[1:3], 1e-6) #Prevent 0 after log
+  se_h_time <- h_time[1:3]
+  
+  se_fit <- lm(log(se_heavy) ~ se_h_time) #Approximating linearly
+
+  kd_start <- -coef(se_fit)[2]
+  kd_start <- max(kd_start, 1e-6)
+
+  #kT starting parameter
+  se_light <- c(sub_light[1], pmax(tail(sub_light, 1), 1e-6))
+  se_l_time <- c(light_trim[1], tail(light_trim, 1))
+
+  initial_slope <- (se_light[2] - se_light[1]) / (se_l_time[2] - se_l_time[1])
+  kt_start <- initial_slope + kd_start * se_light[1]
+  kt_start <- max(kt_start, 1e-6)  # keep non-negative
+  
+  #Baseline starting parameter
+  phi_start <- max(mean(tail(heavy_data, 3)), 0.01)
+
+  #--- Bounds ----------------------------  
+  
+  m0_heavy_lower <- max(m0_heavy_start * 0.5, 0.1)
+  m0_ctrl_lower <- max(m0_ctrl_start * 0.5, 0.1)
+  C_upper <- mean(tail(heavy_data, 3)) * 1.5
+  kd_upper <- log(2) / 5    # Shortest half-life ~ 5 min
+  kt_upper <- kd_upper * m0_heavy_start * 2  
+  
+  #--- No Baseline Model ----------------------------    
+
+  simple_fit <- tryCatch( #No baseline model
+    nlsLM(all_data ~ simple_pred_model(all_time, heavy_n, light_n,
+                                       m0_heavy, m0_ctrl, kd, kt,
+                                       pep_k1, pep_k2),
+          start = list(m0_heavy = m0_heavy_start,
+                       m0_ctrl = m0_ctrl_start,
+                       kd = kd_start,
+                       kt = kt_start),
+          lower = c(m0_heavy = m0_heavy_lower,
+                    m0_ctrl = m0_ctrl_lower,
+                    kd = 1e-6,
+                    kt = 0),
+          upper = c(m0_heavy = heavy_data[1] * 1.2,
+                    m0_ctrl = sub_light[1] * 1.2,
+                    kd = kd_upper,
+                    kt = kt_upper),
+          control = nls.lm.control(maxiter = 1000)),
+    error = function(e) NULL )
+
+  #Extracting fit features from object  
+  if (is.null(simple_fit)) {
+    simple_pred_values <- c(m0_heavy = NA, m0_ctrl = NA, kd = NA, kt = NA)
+    simple_predict <- rep(NA, length(all_data))
+    simple_RSS <- NA }
+  else {
+    simple_pred_values <- coef(simple_fit) 
+    simple_predict <- predict(simple_fit)
+    simple_RSS <- deviance(simple_fit) }
+
+  #--- No Baseline Model ----------------------------    
+
+  max_phi <- 0.25
+  if (phi_start >= max_phi) { phi_start <- max_phi - 0.01 }
+  
+  baseline_fit <- tryCatch( #No baseline model
+    nlsLM(all_data ~ twopool_pred_model(all_time, heavy_n, light_n,
+                                        m0_heavy, m0_ctrl, kd, kt,
+                                        pep_k1, pep_k2, phi),
+          start = list(m0_heavy = m0_heavy_start,
+                       m0_ctrl = m0_ctrl_start,
+                       kd = kd_start,
+                       kt = kt_start,
+                       phi = phi_start),
+          lower = c(m0_heavy = m0_heavy_lower,
+                    m0_ctrl = m0_ctrl_lower,
+                    kd = 1e-6,
+                    kt = 0,
+                    phi = 0),
+          upper = c(m0_heavy = heavy_data[1] * 1.2,
+                    m0_ctrl = sub_light[1] * 1.2,
+                    kd = kd_upper,
+                    kt = kt_upper,
+                    phi = max_phi),
+          control = nls.lm.control(maxiter = 1000)),
+    error = function(e) NULL )    
+
+  #Extracting fit features from object
+  if (is.null(baseline_fit)) {
+    baseline_pred_values <- c(m0_heavy = NA, m0_ctrl = NA, kd = NA, kt = NA,
+                              phi = NA)
+    baseline_predict <- rep(NA, length(all_data))
+    baseline_RSS <- NA }
+  else {
+    baseline_pred_values <- coef(baseline_fit)
+    baseline_predict <- predict(baseline_fit)
+    baseline_RSS <- deviance(baseline_fit) }
+  
+  #--- Output ----------------------------
+
+  if ( is.na(simple_RSS) ) { deltaBIC <- NA }
+  else if ( is.na(baseline_RSS) ) { deltaBIC <- NA }
+  else {
+    total_n <- length(all_data)
+    simple_BIC <- total_n * log(simple_RSS/total_n) + 4 * log(total_n)
+    baseline_BIC <- total_n * log(baseline_RSS/total_n) + 5 * log(total_n)
+
+    deltaBIC <- ifelse(baseline_BIC < simple_BIC, abs(baseline_BIC - simple_BIC),
+                       -1 * abs(baseline_BIC - simple_BIC)) }
+
+  print(row)
+  print(m0_heavy_lower)
+  cat("\n\n")
+  
+  plot(h_time, all_data[1:12], ylim=c(0,3))
+  lines(h_time, simple_predict[1:12], col="red")
+  lines(h_time, baseline_predict[1:12], col="blue")
+
+  plot(l_time, as.numeric(row[light.channels]), ylim=c(0,3))
+  lines(light_trim, simple_predict[13:length(all_data)], col="red", lty="dashed")
+  lines(light_trim, baseline_predict[13:length(all_data)], col="blue", lty="dashed")
+
+  col_names <- c("Peptide", "Pep_k1", "Pep_k2", "N_Light", "deltaBIC",
+                 paste0("Simple_", names(simple_pred_values)),
+                 paste0("Baseline_", names(baseline_pred_values)))
+  out_df <- data.frame(matrix(nrow=0, ncol = length(col_names)))
+  colnames(out_df) <- col_names
+
+  out_df[1,"Peptide"] <- row["Peptide"]
+  out_df[1, 2:14] <- c(pep_k1, pep_k2, light_cutoff, deltaBIC,
+                      simple_pred_values, baseline_pred_values)
+  
+  return(out_df) }
+
+
+#---------------------------------------------------------------------------------------
+
+fit_k_rates <- function(protein_id, pep_df, l_time, h_time) {
+
+  pep_df <- pep_df[pep_df$Protein_ID == protein_id,]
+  pepfit <- apply(pep_df, 1, function(x) { peptide_fit(x, l_time, h_time) })
+  pepfit <- do.call(rbind, pepfit)
+  pepfit <- cbind(data.frame(Protein_ID = rep(protein_id, nrow(pepfit))),
+                  pepfit) 
+
+  return(pepfit) }
+
+# fit_k_rates("XBmRNA1670|XBXL10_1g1076", norm_T9.df, Frog_T9_light.min, Frog_T9_all.min)
+# fit_k_rates("XBmRNA1670|XBXL10_1g1076", norm_T10.df, Frog_T9_light.min, Frog_T9_all.min)
+
+# fit_k_rates("XBmRNA4619|XBXL10_1g2646", norm_T9.df, Frog_T9_light.min, Frog_T9_all.min)
+# fit_k_rates("XBmRNA4619|XBXL10_1g2646", norm_T10.df, Frog_T9_light.min, Frog_T9_all.min)
+
+#Setup cluster
+cl <- makeCluster(num_cores)
+
+#Export necessary variables/functions to the cluster nodes
+clusterExport(cl,
+              varlist=c("light.channels", "heavy.channels",
+                        "Frog_T9_light.min", "Frog_T9_all.min",
+                        "norm_T9.df", "norm_T10.df", "fit_k_rates",
+                        "peptide_fit", "pep_decay_rate", "simple_normal_model",
+                        "simple_heavy_model", "simple_pred_model",
+                        "twopool_pred_model",
+                        "twopool_normal_model", "twopool_heavy_model"))
+invisible(clusterEvalQ(cl, library(minpack.lm)))
+
+T9_pep_fits <- parLapply(cl, unique(norm_T9.df$Protein_ID), function(x){
+  fit_k_rates(x, norm_T9.df, Frog_T9_light.min, Frog_T9_all.min) }) %>%
+  bind_rows
+
+T10_pep_fits <- parLapply(cl, unique(norm_T10.df$Protein_ID), function(x){
+  fit_k_rates(x, norm_T10.df, Frog_T9_light.min, Frog_T9_all.min) }) %>%
+  bind_rows
+
+stopCluster(cl) #Stop Cluster
+
+head(T9_pep_fits)
+head(T10_pep_fits)
+
+```
+
+
+```{r Gast. Precision Limits }
+
+max_fit_kd <- log(2)/(tail(avg_heavy_time, 1)*3)
+max_fit_hl <- log(2)/max_fit_kd/60
+cat("Max Half-life (hrs):\t", max_fit_hl) 
+
+```
+
+
+```{r Filtering for data that fit model }
+
+T9_pep_fits <- T9_pep_fits[!is.na(T9_pep_fits$Simple_kd),]
+norm_T9.df <- norm_T9.df[norm_T9.df$Peptide %in% T9_pep_fits$Peptide,]
+
+T10_pep_fits <- T10_pep_fits[!is.na(T10_pep_fits$Simple_kd),]
+norm_T10.df <- norm_T10.df[norm_T10.df$Peptide %in% T10_pep_fits$Peptide,]
+
+```
+
+
+```{r Exploratory analysis not included in manuscript }
+
+pep_fit_comp <- T9_pep_fits
+pep_fit_comp <- pep_fit_comp[!is.na(pep_fit_comp$deltaBIC),]
+
+pep_fit_comp["Model"] <- rep("Unselected", nrow(pep_fit_comp))
+pep_fit_comp[pep_fit_comp$deltaBIC < 0, "Model"] <- "Simple"
+pep_fit_comp[pep_fit_comp$deltaBIC > 0, "Model"] <- "Two-pool"
+pep_fit_comp[pep_fit_comp$deltaBIC > 10, "deltaBIC"] <- 10
+
+table(pep_fit_comp$Model)
+
+p1 <- ggplot() +
+  geom_point(data=pep_fit_comp[pep_fit_comp$Model == "Simple",],
+             aes(x=log10(Simple_kd), y=log10(Baseline_kd)),
+             size=2, alpha=0.5) +
+  geom_abline(slope=1, intercept=0, linetype="dashed", linewidth=1,
+              color="red") +
+  geom_vline(xintercept = log10(max_fit_kd),
+             linewidth=1, color="hotpink") +
+  geom_hline(yintercept = log10(max_fit_kd),
+             linewidth=1, color="hotpink") +  
+  theme_bw() +
+  theme(aspect.ratio=1) +
+  labs(x=expression("Simple log"[10]*"(min"^-1*")"),
+       y=expression("Baseline log"[10]*"(min"^-1*")"),
+       title="Prefers Simple Model") +
+  coord_cartesian(xlim=c(-6, -1), ylim=c(-6, -1))
+
+p2 <- ggplot() +
+  geom_point(data=pep_fit_comp[pep_fit_comp$Model == "Two-pool",],
+             aes(x=log10(Simple_kd), y=log10(Baseline_kd),
+                 color=deltaBIC),
+             size=2, alpha=0.5) +
+  geom_abline(slope=1, intercept=0, linetype="dashed", linewidth=1,
+              color="red") +
+  geom_vline(xintercept = log10(max_fit_kd),
+             linewidth=1, color="hotpink") +
+  geom_hline(yintercept = log10(max_fit_kd),
+             linewidth=1, color="hotpink") +  
+  theme_bw() +
+  theme(aspect.ratio=1) +
+  labs(x=expression("Simple log"[10]*"(min"^-1*")"),
+       y=expression("Baseline log"[10]*"(min"^-1*")"),
+       title="Prefers Baseline Model") +
+  coord_cartesian(xlim=c(-6, -1), ylim=c(-6, -1))
+
+
+# #Uncomment for new image!
+# tiff("graph1.tiff", units="in",
+#      width=9, height=4.5, res=300)
+
+p1 | p2
+
+# dev.off() #Uncomment for new image!
+
+```
+
+
+
+```{r Merged dataset }
+
+protein_rollup <- function(protein_id, all_reps){
+
+  sub_data <-  all_reps[all_reps$Protein_ID==protein_id,]
+
+  final_calc_lst <- lapply(unique(sub_data$Exp), function(x){
+    
+    sub_exp <- sub_data[sub_data$Exp == x,]
+    sub_exp["Fraction"] <- sub_exp$sum_sn / sum(sub_exp$sum_sn)
+  
+    sub_exp[light.channels] <- sub_exp[light.channels] * sub_exp$Fraction
+    light_avg <- apply(sub_exp[light.channels], 2, sum)
+    light_avg <- light_avg / mean(light_avg)
+  
+    sub_exp[heavy.channels] <- sub_exp[heavy.channels] * sub_exp$Fraction
+    heavy_avg <- apply(sub_exp[heavy.channels], 2, sum)
+    heavy_avg <- heavy_avg / mean(heavy_avg)
+    
+    return(c(light_avg, heavy_avg)) })
+  
+  merged_matrix <- do.call(rbind, final_calc_lst)
+  merged_avg <- apply(merged_matrix, 2, mean)
+
+  merged_avg[light.channels] <-
+    merged_avg[light.channels] / mean(merged_avg[light.channels])
+  merged_avg[heavy.channels] <-
+    merged_avg[heavy.channels] / mean(merged_avg[heavy.channels])
+
+  protein_avg <- cbind(data.frame(Protein_ID = protein_id),
+                       data.frame(t(merged_avg)))
+
+  return(protein_avg) }
+
+
+protein_med_merge <- rbind(cbind(norm_T9.df,
+                                 data.frame(Exp=rep("T9", nrow(norm_T9.df)))),
+                           cbind(norm_T10.df,
+                                 data.frame(Exp=rep("T10", nrow(norm_T10.df)))))
+
+#Setup cluster
+cl <- makeCluster(num_cores)
+
+#Export necessary variables/functions to the cluster nodes
+clusterExport(cl,
+              varlist=c("protein_med_merge", "protein_rollup",
+                        "light.channels", "heavy.channels"))
+
+protein_med_merge <- parLapply(cl, unique(protein_med_merge$Protein_ID),
+       function(x){ protein_rollup(x, protein_med_merge) }) %>% bind_rows
+
+stopCluster(cl) #Stop Cluster
+
+# protein_med_merge <- merge(human_map, protein_med_merge, by="Protein_ID", all.y=TRUE)
+# protein_med_merge[is.na(protein_med_merge$Human_Gene), "XLA_Gene"] <- "N/A"
+# protein_med_merge[is.na(protein_med_merge$Human_Gene), "Human_Gene"] <- "N/A"
+
+head(protein_med_merge)
+
+```
+
+
+# BIC Calculation
+
+```{r Calculating median protein degradation rates }
+
+merge_pep_fits <- function(protein_id, exp1, exp2) {
+
+  exp1_sub <- exp1[exp1$Protein_ID == protein_id,]
+  exp2_sub <- exp2[exp2$Protein_ID == protein_id,]
+
+  pep_data <- rbind(exp1_sub[c("Peptide", "Pep_k1", "Pep_k2")],
+                    exp2_sub[c("Peptide", "Pep_k1", "Pep_k2")])
+  pep_data <- unique(pep_data)
+      
+  if (nrow(exp1_sub) > 0 & nrow(exp2_sub) > 0) {
+
+    fitted_values_1 <- exp1_sub[c("Simple_m0_heavy", "Simple_kd",
+                                  "Simple_kt")]
+    fitted_values_1 <- apply(fitted_values_1, 2, median)
+    
+    fitted_values_2 <- exp2_sub[c("Simple_m0_heavy",
+                                  "Simple_kd", "Simple_kt")]
+    fitted_values_2 <- apply(fitted_values_2, 2, median)
+    
+    estimate_desc <- "interval"
+    exp1_kD <- fitted_values_1["Simple_kd"]
+    exp2_kD <- fitted_values_2["Simple_kd"]    
+    merged_values <- (fitted_values_1 + fitted_values_2)/2 }
+
+  else if (nrow(exp1_sub) > 0 & nrow(exp2_sub) == 0) {
+
+    estimate_desc <- "point"            
+    merged_values <- exp1_sub[c("Simple_m0_heavy", "Simple_kd", "Simple_kt")]
+    merged_values <- apply(merged_values, 2, median) 
+    
+    exp1_kD <- merged_values["Simple_kd"]
+    exp2_kD <- NA }  
+
+  else if (nrow(exp1_sub) == 0 & nrow(exp2_sub) > 0) {
+
+    estimate_desc <- "point"    
+    merged_values <- exp2_sub[c("Simple_m0_heavy", "Simple_kd", "Simple_kt")]
+    merged_values <- apply(merged_values, 2, median)
+    
+    exp1_kD <- NA
+    exp2_kD <- merged_values["Simple_kd"] }
+  
+  else { cat("Logic Error"); invokeRestart("abort") }
+
+  names(merged_values) <- c("m0_heavy", "kd", "kt")
+  
+  pep_predict <- apply(pep_data[2:3], 1, function(sub_pep){
+
+    predict_fit <- simple_heavy_model(avg_heavy_time, merged_values["m0_heavy"],
+                                      merged_values["kd"], merged_values["kt"],
+                                      sub_pep["Pep_k1"], sub_pep["Pep_k2"])
+    
+    return(data.frame(t(predict_fit))) })
+
+  pep_predict <- do.call(rbind, pep_predict)
+  pep_predict <- apply(pep_predict, 2, median)
+  
+  out_df <- data.frame(t(pep_predict))
+  colnames(out_df) <- paste0("Fit_", heavy.channels)
+  
+  out_df <- cbind(data.frame(Protein_ID = protein_id,
+                             kD = merged_values["kd"],
+                             HL_Hrs = log(2)/merged_values["kd"]/60),                             
+                             Estimate = estimate_desc,
+                             T9_kD = exp1_kD, T10_kD = exp2_kD,
+                  out_df)
+  
+  return(out_df) }
+
+Deg_fits.df <- lapply(protein_med_merge$Protein_ID,
+                      function(x) { merge_pep_fits(x, T9_pep_fits, T10_pep_fits) }) %>%
+  bind_rows() %>% arrange(desc(kD))
+
+head(Deg_fits.df)
+
+```
+
+
+```{r Calculating BIC for each protein }
+
+Deg_fits.df["deltaBIC"] <- apply(Deg_fits.df, 1, function(row){
+
+  protein_id <- row["Protein_ID"]
+  dyn_fit <- as.numeric(row[grepl("Fit", names(row))])
+  
+  med_data <- protein_med_merge[protein_med_merge$Protein_ID == protein_id,]
+  med_data <- as.numeric(med_data[heavy.channels])
+  
+  total_n <- length(med_data)
+  
+  flat_line <- rep(1, total_n)
+
+  model_RSS <- sum((med_data - dyn_fit)^2)
+  flat_RSS <- sum((med_data - flat_line)^2)
+    
+  model_BIC <- total_n * log(model_RSS/total_n) + 4 * log(total_n)
+  flat_BIC <- total_n * log(flat_RSS/total_n) + 0 * log(total_n)
+  
+  deltaBIC <- ifelse(model_BIC < flat_BIC, abs(model_BIC - flat_BIC),
+                     -1 * abs(model_BIC - flat_BIC))
+  
+  return(deltaBIC) })
+
+head(Deg_fits.df)
+
+```
+
+
+```{r Shuffle function }
+
+true_shuffle <- function(x) {
+  
+  n <- length(x)
+  original <- x
+  shuffled <- sample(x)
+
+  #Keep re-rolling until NO elements match their starting position
+  # -> This prevents correlation for fastest degraders
+  #Also, stop from last timepoint ending up with the first one
+  # -> This prevents anti-correlation for fastest degraders
+  while(any(shuffled == original) || shuffled[n] == original[1]) {
+    shuffled <- sample(x) }
+  
+  return(shuffled) }
+
+```
+
+
+```{r Final dataset of frog gastrulation half-lives }
+
+final_xla_gast <- merge(human_map, Deg_fits.df, by="Protein_ID", all.y=TRUE)
+final_xla_gast[is.na(final_xla_gast$XLA_Gene), "XLA_Gene"] <- "N/A"
+final_xla_gast[is.na(final_xla_gast$Human_Gene), "Human_Gene"] <- "N/A"
+final_xla_gast <- final_xla_gast[c(colnames(final_xla_gast)[1:8],
+                                   "deltaBIC")]
+final_xla_gast <- merge(final_xla_gast, protein_med_merge, by="Protein_ID")
+final_xla_gast <- final_xla_gast %>% arrange(desc(kD))
+
+head(final_xla_gast)
+
+```
+
+
+```{r Simplified function to only fit kT/kD for simple model }
+
+dyn_model_pep_fit <- function(row, l_time, h_time, heavy_header) {
+  
+  #--- Model input ----------------------------  
+  
+  pep_k1 <- as.numeric(row["Pep_k1"])
+  pep_k2 <- as.numeric(row["Pep_k2"])
+
+  heavy_data <- as.numeric(row[heavy_header])
+
+  light_cutoff <- as.numeric(row["N_timepoints"])
+  light_trim <- l_time[1:light_cutoff]
+  sub_light <- as.numeric(row[light.channels])[1:light_cutoff]
+
+  #Input for nlsLM
+  all_data <- c(heavy_data, sub_light)
+  all_time <- c(h_time, light_trim)
+
+  heavy_n <- length(all_time) - length(light_trim)
+  light_n <- length(light_trim)
+  
+  #--- Starting Guess ----------------------------  
+  
+  #Starting channel parameters
+  m0_heavy_start <- heavy_data[1]
+  m0_ctrl_start <- sub_light[1]
+
+  #kD starting parameter 
+  se_heavy <- pmax(heavy_data[1:3], 1e-6) #Prevent 0 after log
+  se_h_time <- h_time[1:3]
+  
+  se_fit <- lm(log(se_heavy) ~ se_h_time) #Approximating linearly
+
+  kd_start <- -coef(se_fit)[2]
+  kd_start <- max(kd_start, 1e-6)
+
+  #kT starting parameter
+  se_light <- c(sub_light[1], pmax(tail(sub_light, 1), 1e-6))
+  se_l_time <- c(light_trim[1], tail(light_trim, 1))
+
+  initial_slope <- (se_light[2] - se_light[1]) / (se_l_time[2] - se_l_time[1])
+  kt_start <- initial_slope + kd_start * se_light[1]
+  kt_start <- max(kt_start, 1e-6)  # keep non-negative
+  
+  #--- Bounds ----------------------------  
+  
+  m0_heavy_lower <- max(heavy_data[1] * 0.5, 0.1)
+  m0_ctrl_lower <- max(sub_light[1] * 0.5, 0.1)
+  kd_upper <- log(2) / 5    # Shortest half-life ~ 5 min
+  kt_upper <- kd_upper * heavy_data[1] * 2    
+  
+  #--- No Baseline Model ----------------------------      
+  
+  simple_fit <- tryCatch( #No baseline model
+    nlsLM(all_data ~ simple_pred_model(all_time, heavy_n, light_n,
+                                       m0_heavy, m0_ctrl, kd, kt,
+                                       pep_k1, pep_k2),
+          start = list(m0_heavy = m0_heavy_start,
+                       m0_ctrl = m0_ctrl_start,
+                       kd = kd_start,
+                       kt = kt_start),
+          lower = c(m0_heavy = m0_heavy_lower,
+                    m0_ctrl = m0_ctrl_lower,
+                    kd = 1e-6,
+                    kt = 0),
+          upper = c(m0_heavy = heavy_data[1] * 1.2,
+                    m0_ctrl = sub_light[1] * 1.2,
+                    kd = kd_upper,
+                    kt = kt_upper),
+          control = nls.lm.control(maxiter = 1000)),
+    error = function(e) NULL )
+
+  #Extracting fit features from object  
+  if (is.null(simple_fit)) {
+    simple_pred_values <- c(m0_heavy = NA, m0_ctrl = NA, kd = NA, kt = NA) }
+  else {
+    simple_pred_values <- coef(simple_fit) }
+  
+  return(data.frame(t(simple_pred_values))) }
+
+```
+
+
+```{r BIC cutoff calculation via scrambled dataset }
+
+#Setup cluster
+cl <- makeCluster(num_cores)
+
+#Export necessary variables/functions to the cluster nodes
+clusterExport(cl,
+              varlist=c("light.channels", "heavy.channels",
+                        "Frog_T9_light.min", "Frog_T9_all.min",
+                        "avg_heavy_time",
+                        "norm_T9.df", "norm_T10.df", "protein_med_merge",
+                        "dyn_model_pep_fit", "true_shuffle",
+                        "simple_normal_model",
+                        "simple_heavy_model", "simple_pred_model"))
+invisible(clusterEvalQ(cl, library(minpack.lm)))
+
+NULL_BIC_values <- parApply(cl, Deg_fits.df, 1, function(row) {
+
+  protein_id <- row["Protein_ID"]
+  total_n <- length(heavy.channels)
+  flat_predict <- rep(1, total_n)
+
+  median_data <- protein_med_merge[protein_med_merge$Protein_ID == protein_id,]
+  T9_check <- is.na(row["T9_kD"])
+  T10_check <- is.na(row["T10_kD"])
+
+  real_deltaBIC <- as.numeric(row["deltaBIC"])
+
+  if (T9_check) {
+    T10_peps <- norm_T10.df[norm_T10.df$Protein_ID == protein_id,]
+    pep_data <- T10_peps[c("Peptide", "Pep_k1", "Pep_k2")] }
+  else if (T10_check) {
+    T9_peps <- norm_T9.df[norm_T9.df$Protein_ID == protein_id,]
+    pep_data <- T9_peps[c("Peptide", "Pep_k1", "Pep_k2")] }
+  else {
+    T9_peps <- norm_T9.df[norm_T9.df$Protein_ID == protein_id,]
+    T10_peps <- norm_T10.df[norm_T10.df$Protein_ID == protein_id,]
+
+    pep_data <- rbind(T9_peps[c("Peptide", "Pep_k1", "Pep_k2")],
+                      T10_peps[c("Peptide", "Pep_k1", "Pep_k2")])
+    pep_data <- unique(pep_data) }
+
+  NULL_BIC_deltas <- sapply(1:10, function(dummy) {
+
+    #-- Fit ------------------------------------------
+
+    # new_header <- heavy.channels
+    new_header <- true_shuffle(heavy.channels)
+    scrambled_median <- as.numeric(median_data[new_header])
+
+    if (T9_check) {
+
+      T10_fits <- apply(T10_peps, 1, function(x) {
+        dyn_model_pep_fit(x, Frog_T9_light.min, Frog_T9_all.min, new_header) } )
+      T10_fits <- do.call(rbind, T10_fits)
+      merged_values <- apply(T10_fits, 2, median, na.rm = TRUE) }
+
+    else if (T10_check) {
+
+      T9_fits <- apply(T9_peps, 1, function(x) {
+        dyn_model_pep_fit(x, Frog_T9_light.min, Frog_T9_all.min, new_header) } )
+      T9_fits <- do.call(rbind, T9_fits)
+      merged_values <- apply(T9_fits, 2, median, na.rm = TRUE) }
+
+    else {
+
+      T9_fits <- apply(T9_peps, 1, function(x) {
+        dyn_model_pep_fit(x, Frog_T9_light.min, Frog_T9_all.min, new_header) } )
+      T9_fits <- do.call(rbind, T9_fits)
+      T9_fits <- apply(T9_fits, 2, median, na.rm = TRUE)
+
+      T10_fits <- apply(T10_peps, 1, function(x) {
+        dyn_model_pep_fit(x, Frog_T9_light.min, Frog_T9_all.min, new_header) } )
+      T10_fits <- do.call(rbind, T10_fits)
+      T10_fits <- apply(T10_fits, 2, median, na.rm = TRUE)
+
+      merged_values <- (T9_fits + T10_fits)/2 }
+
+    #-- Prediction ------------------------------------------
+    if (any(is.na(merged_values))) {
+      deltaBIC <- (-100)
+      return(deltaBIC) }
+    else { } # ... normal BIC computation ...
+
+    pep_predict <- apply(pep_data[2:3], 1, function(sub_pep){
+
+      predict_fit <- simple_heavy_model(avg_heavy_time, merged_values["m0_heavy"],
+                                        merged_values["kd"], merged_values["kt"],
+                                        sub_pep["Pep_k1"], sub_pep["Pep_k2"])
+
+      return(data.frame(t(predict_fit))) })
+
+    pep_predict <- do.call(rbind, pep_predict)
+    pep_predict <- apply(pep_predict, 2, median)
+
+    #-- BIC Calculation ------------------------------------------
+
+    model_RSS <- sum((scrambled_median - pep_predict)^2)
+    flat_RSS <- sum((scrambled_median - flat_predict)^2)
+
+    model_BIC <- total_n * log(model_RSS/total_n) + 4 * log(total_n)
+    flat_BIC <- total_n * log(flat_RSS/total_n) + 0 * log(total_n)
+
+    deltaBIC <- ifelse(model_BIC < flat_BIC, abs(model_BIC - flat_BIC),
+                       -1 * abs(model_BIC - flat_BIC))
+
+    return(deltaBIC) })
+
+  return(NULL_BIC_deltas) })
+
+NULL_BIC_values <- as.vector(NULL_BIC_values)
+NULL_BIC_values[1:20]
+
+stopCluster(cl) #Stop Cluster
+
+```
+
+
+```{r BIC cutoff determination }
+
+real_scores <- Deg_fits.df$deltaBIC
+
+current_cutoff <- 20.0
+current_FDR <- 0
+
+#Walk down by 0.1 until FDR hits 5%
+while(current_FDR < 0.05) {
+
+  #How many real proteins pass this cutoff?
+  real_hits <- sum(real_scores > current_cutoff)
+
+  # How many noise proteins pass this cutoff?
+  # - Divide by dataset multiplier size
+  expected_false_positives <- sum(NULL_BIC_values > current_cutoff) / 10
+
+  #Calculate FDR
+  current_FDR <- expected_false_positives / real_hits
+
+  #Step the cutoff down
+  current_cutoff <- current_cutoff - 0.1 }
+
+#The loop breaks when FDR hits 5%.
+final_BIC_threshold <- current_cutoff + 0.1
+
+paste("The 5% FDR Threshold is Delta BIC >", final_BIC_threshold)
+
+```
+
+
+```{r BIC cutoff plot }
+
+plot_data <- data.frame(
+  BIC_Score = c(NULL_BIC_values, real_scores),
+  Distribution = c(rep("Null (Noise)", length(NULL_BIC_values)),
+                   rep("Real Data", length(real_scores))))
+plot_data["Distribution"] <- factor(plot_data$Distribution,
+                                    levels=c("Null (Noise)", "Real Data"))
+plot_data$Weight <- ifelse(plot_data$Distribution == "Real Data", 1, 1/10)
+
+hist_deltaBIC <- ggplot(plot_data, aes(x = BIC_Score, fill = Distribution, weight = Weight)) +
+  geom_histogram(position = "identity", binwidth = 1, alpha=0.5) +
+  geom_vline(xintercept = final_BIC_threshold, linetype="dashed", color="black",
+             linewidth=1) +
+  labs(x = expression(Delta * " BIC Score"),
+       y = "Expected Frequency") +
+  theme_bw() +
+  theme(axis.text=element_text(size=21,colour="black"),
+        plot.title = element_text(size=24, hjust=0.5),
+        axis.title = element_text(size=22),
+        panel.border = element_rect(linewidth=2),
+        panel.grid.major = element_line(color = "grey90", linewidth = 0.25),
+        panel.grid.minor = element_line(color = "grey90", linewidth = 0.25),
+        legend.position = "none",
+        plot.margin = margin(t = 10, r = 25, b = 10,
+                             l = 10, unit = "pt")) +
+  scale_fill_manual(values = c("Null (Noise)" = "black", "Real Data" = "#56B4E9"))
+
+# #Uncomment for new image!
+# tiff("frog_gast_deltaBIC_hist_10variations.tiff", units="in",
+#      width=6, height=4.5, res=300)
+
+hist_deltaBIC
+
+# dev.off() #Uncomment for new image!
+
+```
+
+
+```{r Final thresholded dataset }
+
+final_BIC_threshold <- 2
+
+final_xla_gast["mClass"] <- rep("Flat", nrow(final_xla_gast))
+final_xla_gast[(final_xla_gast$deltaBIC > final_BIC_threshold),
+               "mClass"] <- "Deg"
+final_xla_gast[final_xla_gast$kD < max_fit_kd, "HL_Hrs"] <- max_fit_hl
+
+head(final_xla_gast)
+
+```
+
+
+```{r Degradation rate biplot for degrading proteins }
+
+ss_bp.all <- final_xla_gast
+
+ss_bp.all <- ss_bp.all[!is.na(ss_bp.all$T9_kD),]
+ss_bp.all <- ss_bp.all[!is.na(ss_bp.all$T10_kD),]
+
+ss_bp.all["Avg_kD"] <- (ss_bp.all$T9_kD + ss_bp.all$T10_kD)/2
+
+ss_bp.all["Log10_T9"] <- log10(ss_bp.all$T9_kD)
+ss_bp.all["Log10_T10"] <- log10(ss_bp.all$T10_kD)
+ss_bp.all[ss_bp.all$Log10_T9<(-8), "Log10_T9"] <- (-8)
+ss_bp.all[ss_bp.all$Log10_T10<(-8), "Log10_T10"] <- (-8)
+
+cor(ss_bp.all$Log10_T9, ss_bp.all$Log10_T10)^2
+
+cor(ss_bp.all[ss_bp.all$mClass=="Deg",]$Log10_T9,
+    ss_bp.all[ss_bp.all$mClass=="Deg",]$Log10_T10)^2
+
+p1 <- ggplot() +
+  geom_point(data=ss_bp.all[ss_bp.all$mClass == "Deg",],
+             aes(x=Log10_T9, y=Log10_T10),
+             shape=1, size=3, stroke=1, alpha=0.5) +  
+  
+  geom_hline(yintercept=log10(max_fit_kd), size=1, linetype="dashed") +
+  geom_vline(xintercept=log10(max_fit_kd), size=1, linetype="dashed") +
+
+  geom_abline(slope=1, intercept=0, color="black", linetype="dotted",
+              linewidth=1) +
+  labs(x=expression("R1 log"[10]*"(min"^-1*")"),
+       y=expression("R2 log"[10]*"(min"^-1*")")) +
+  theme_bw() +
+  theme(axis.text=element_text(size=24,colour="black"),
+        plot.title = element_text(size=24, hjust=0.5),
+        axis.title = element_text(size=22),
+        panel.border = element_rect(linewidth=2),
+        panel.grid.major = element_line(color = "grey90", linewidth = 0.25),
+        panel.grid.minor = element_line(color = "grey90", linewidth = 0.25),
+        aspect.ratio = 1,
+        legend.position = "none",
+        plot.margin = margin(t = 10, r = 25, b = 10,
+                             l = 10, unit = "pt")) +
+  coord_cartesian(xlim = c(-6,0),
+                  ylim = c(-6,0)) +
+  scale_color_manual(values=c("#5E4FA2", "#767676"))
+
+# #Uncomment for new image!
+# tiff("2C_kD_biplot.tiff", units="in",
+#      width=5, height=5, res=300)
+
+p1
+
+# dev.off() #Uncomment for new image!
+
+```
+
+
+```{r Counting peptides used for each fit }
+
+peptide_count <- data.frame(table(rbind(norm_T9.df[1:2],
+                                        norm_T10.df[1:2])$Protein_ID))
+colnames(peptide_count) <- c("Protein_ID", "Number_Pep_Fits")
+
+final_xla_gast <- merge(final_xla_gast, peptide_count, by="Protein_ID") %>%
+  arrange(desc(kD))
+
+head(final_xla_gast)
+
+```
+
+
+```{r Creating supplemental table }
+
+supp_df <- merge(protein_annotation, final_xla_gast,
+                 by="Protein_ID", all.y=TRUE) %>%
+  arrange(desc(kD)) %>%
+  dplyr::select(Protein_ID, XLA_Gene, Human_Gene,
+                Description, everything())
+
+supp_df["Is_Degrading"] <- rep("Unknown", nrow(supp_df))
+supp_df[supp_df$mClass == "Deg", "Is_Degrading"] <- "Yes"
+supp_df[supp_df$mClass == "Flat", "Is_Degrading"] <- "No"
+
+supp_df[c("mClass")] <- NULL
+colnames(supp_df) <-
+  c("Protein ID", "XenBase Annotation", "Human Protein", "Description",
+    "Fitted kD", "Reported Half-life (Hrs)", "Estimate Confidence",
+    "Replicate 1 kD", "Replicate 2 kD", "BIC against NULL",
+    paste0("Control: ", round((avg_light_time+1472)/60, 1), " hpf"),
+    paste0("18O: ", round((avg_heavy_time+1472)/60, 1), " hpf"),
+    "Peptides Quantified", "Is Degrading?")
+
+supp_df[(supp_df$`Is Degrading?`=="No") &
+          (supp_df$`Reported Half-life (Hrs)` < max_fit_hl),
+        "Reported Half-life (Hrs)"] <- NA
+supp_df <- rbind(supp_df[!is.na(supp_df$`Reported Half-life (Hrs)`),],
+                 supp_df[is.na(supp_df$`Reported Half-life (Hrs)`),])
+
+write.csv(supp_df, "Files/Supp_Tables/Frog_Gastrulation_Supplementary_Table.csv",
+          row.names = FALSE)
+
+```
+
+
+```{r Exporting for external use in other scripts }
+
+write.csv(final_xla_gast,
+          "Files/Fits/Dyn-Model/XLA_O18_T9-10_FinalFits_ALL.csv",
+          row.names = FALSE)
+
+```
+
+
+```{r}
+
+sessionInfo()
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

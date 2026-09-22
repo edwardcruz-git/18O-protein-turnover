@@ -1,0 +1,339 @@
+---
+title: "General relationship between turnover, dynamicity, and abundance"
+author: "Edward Cruz"
+date: "2026-05-13"
+output: github_document
+---
+
+```{r Libraries }
+
+rm(list=ls(all=T))
+library(dplyr)
+library(fgsea)
+library(stringr)
+library(ggplot2)
+library(Biostrings)
+library(Peptides)
+library(lsa)
+library(patchwork)
+
+knitr::opts_chunk$set(fig.path = "figures/turnover_and_absolute/")
+
+```
+
+
+```{r Importing fasta files and calculating molecular weights }
+
+#FASTA file used to search data
+frog_fasta <- readAAStringSet("Files/FASTA/XENLA_longest-transcript_10p1_GFY-Fix.fasta")
+
+#Converting to a dataframe for merging
+frog_sizes <- data.frame(
+  Protein_ID = names(frog_fasta),
+  Sequence = as.character(frog_fasta),
+  stringsAsFactors = FALSE )
+row.names(frog_sizes) <- NULL
+frog_sizes["Protein_ID"] <- sapply(strsplit(frog_sizes$`Protein_ID`, split = " "),
+                                   "[", 1)
+
+#FASTA file used to search data
+fly_fasta <- readAAStringSet("Files/Reference/Dmel_Uniprot_Proteome_092722.fasta")
+
+#Converting to a dataframe for merging
+fly_sizes <- data.frame(
+  Protein_ID = names(fly_fasta),
+  Sequence = as.character(fly_fasta),
+  stringsAsFactors = FALSE )
+row.names(fly_sizes) <- NULL
+fly_sizes["Protein_ID"] <- sapply(strsplit(fly_sizes$`Protein_ID`, split = " "),
+                                  "[", 1)
+fly_sizes["Protein_ID"] <- sapply(strsplit(fly_sizes$Protein_ID, split = "\\|"),
+                                  "[", 2)
+#---- Calculating MW ----------
+
+frog_sizes["Sequence"] <- str_remove_all(frog_sizes$Sequence,
+                                         "(?i)[^ARNDCEQGHILKMFPSTWYV]")
+fly_sizes["Sequence"] <- str_remove_all(fly_sizes$Sequence,
+                                        "(?i)[^ARNDCEQGHILKMFPSTWYV]")
+
+frog_sizes["kDa"] <- sapply(frog_sizes$Sequence, function(seq){
+    return(mw(seq)/1000) })
+fly_sizes["kDa"] <- sapply(fly_sizes$Sequence, function(seq){
+    return(mw(seq)/1000) })
+
+frog_sizes <- frog_sizes %>% select(Protein_ID, kDa)
+fly_sizes <- fly_sizes %>% select(Protein_ID, kDa)
+
+```
+
+
+```{r Importing frog data }
+
+XLA_T0_Abs <- read.csv("Files/AbsC/XLA_RT0_Abs-Concentrations.csv")
+XLA_T0_Abs <- XLA_T0_Abs[-c(3:4)]
+
+Frog_T5_all.min <- c(161, 221, 281, 401, 521, 641,
+                     881, 1605, 1961, 2918, 4405) - 161
+Frog_T5_light.min <- Frog_T5_all.min[c(1:2, 4:5, 7:8, 10:11)]
+
+Frog_T6_all.min <- c(150, 210, 270, 390, 510, 635,
+                     930, 1591, 1950, 2910, 4394) - 150
+Frog_T6_light.min <- Frog_T6_all.min[c(1:2, 4:5, 7:8, 10:11)]
+
+avg_light_time <- (Frog_T5_light.min + Frog_T6_light.min)/2
+frog_hpf_light <- avg_light_time + ((150+161)/2)
+
+avg_heavy_time <- (Frog_T5_all.min + Frog_T6_all.min)/2
+frog_hpf_heavy <- avg_heavy_time + ((150+161)/2)
+
+#------------------------------------------
+
+XLA_fits_df <- read.csv("Files/Fits/Dyn-Model/XLA_O18_T5-6_FinalFits_ALL.csv")
+head(XLA_fits_df)
+
+```
+
+
+```{r Calculating frog dynamicity and merging }
+
+frog_dyn_df <- XLA_fits_df[c("Protein_ID", "Human_Gene", "kD",
+                             "HL_Hrs", "mClass")]
+
+frog_dyn_df["Dyn"] <- apply(XLA_fits_df[10:17], 1, function(x){
+
+  flat_line <- rep(1, length(x))
+  cosine_distance <- 1-cosine(flat_line, x)[1,]
+
+  return(cosine_distance) })
+
+frog_dyn_df <- merge(frog_dyn_df, XLA_T0_Abs, by.x="Protein_ID", by.y="Ind_Protein_ID")
+frog_dyn_df <- merge(frog_dyn_df, frog_sizes, by="Protein_ID")
+
+```
+
+
+```{r Rescaling frog values for plot }
+
+frog_dyn_df["Plot_iBAQ"] <- log10(frog_dyn_df$iBAQ_Conc*1000)
+frog_dyn_df["Plot_Dyn"] <- log10(frog_dyn_df$Dyn)
+frog_dyn_df["Plot_HL"] <- log10(frog_dyn_df$HL_Hrs)
+frog_dyn_df["Plot_kD"] <- log10(abs(frog_dyn_df$kD))
+frog_dyn_df <- frog_dyn_df %>% arrange(desc(abs(kD)))
+
+head(frog_dyn_df)
+
+```
+
+
+```{r Importing fly data }
+
+Dmel_T0_Abs <- read.csv("Files/AbsC/Dmel_T0_Abs-Concentrations.csv")
+Dmel_T0_Abs <- Dmel_T0_Abs[-c(3:4)]
+
+#------------------------------------------
+
+#Ultimately - collected these minutes apart so used one vector
+Fly_T6.time.min <- c(257, 287, 320, 351, 386, 441, 500,
+                     565, 682, 868, 995, 1218, 1514) - 257
+light_time <- c(0, Fly_T6.time.min[c(4, 8, 11, 13)])
+
+Fly_T6_hpf_time <- ((Fly_T6.time.min + 257) + (Fly_T6.time.min + 117))/2
+Fly_T6_hpf_time <- Fly_T6_hpf_time / 60
+Fly_T6_hpf_light_time <- c(Fly_T6_hpf_time[1], Fly_T6_hpf_time[c(4, 8, 11, 13)])
+
+#------------------------------------------
+
+fly_blast_fits <-
+  read.csv("Files/Fits/Dyn-Model/Fly_O18_T6-7_FinalFits_ALL.csv")
+head(fly_blast_fits)
+
+```
+
+
+```{r Calculating fly dynamicity and merging }
+
+fly_dyn_df <- fly_blast_fits[c("Protein_ID", "Gene_Symbol", "kD",
+                               "HL_Hrs", "mClass")]
+
+fly_dyn_df["Dyn"] <- apply(fly_blast_fits[9:13], 1, function(x){
+
+  flat_line <- rep(1, length(x))
+  cosine_distance <- 1-cosine(flat_line, x)[1,]
+
+  return(cosine_distance) })
+
+fly_dyn_df <- merge(fly_dyn_df, Dmel_T0_Abs, by.x="Protein_ID", by.y="Ind_Protein_ID")
+fly_dyn_df <- merge(fly_dyn_df, fly_sizes, by="Protein_ID")
+
+```
+
+
+```{r Rescaling fly values for plot }
+
+fly_dyn_df["Plot_iBAQ"] <- log10(fly_dyn_df$iBAQ_Conc*1000)
+fly_dyn_df["Plot_Dyn"] <- log10(fly_dyn_df$Dyn)
+fly_dyn_df["Plot_HL"] <- log10(fly_dyn_df$HL_Hrs)
+fly_dyn_df["Plot_kD"] <- log10(abs(fly_dyn_df$kD))
+fly_dyn_df <- fly_dyn_df %>% arrange(desc(abs(kD)))
+
+head(fly_dyn_df)
+
+```
+
+
+```{r Relationship between turnover and turnover }
+
+dyn_ibaq_plots <- function(df, gs_col) {
+  
+  ribo_df <- df[(grepl("^rpl\\d", df[[gs_col]],
+                              ignore.case = TRUE)) &
+                         (!grepl("like", df[[gs_col]],
+                                 ignore.case = TRUE)),]
+  int_df <- df[df$Protein_ID == "XBmRNA21384|XBXL10_1g11382",]
+  
+  # print(ribo_df)
+  # print(median(ribo_df$HL_Hrs))
+  
+  p1 <- ggplot() +
+    geom_point(data=df,
+               aes(y=Plot_iBAQ, x=Plot_Dyn),
+               shape=1, size=3, alpha=0.2, color="black") +
+    
+    geom_point(data=ribo_df,
+               aes(y=Plot_iBAQ, x=Plot_Dyn),
+               size=3, color="#E69F00") +
+    geom_point(data=ribo_df,
+               aes(y=Plot_iBAQ, x=Plot_Dyn),
+               shape=1, size=3, color="black") +
+
+    stat_density_2d(data = df, aes(y=Plot_iBAQ, x=Plot_Dyn),
+                    color = "#CC79A7", linewidth = 2, bins = 3) +
+
+    geom_point(data=int_df,
+               aes(y=Plot_iBAQ, x=Plot_Dyn),
+               size=3, color="#56B4E9") +
+    geom_point(data=int_df,
+               aes(y=Plot_iBAQ, x=Plot_Dyn),
+               shape=1, size=3, color="black") +
+
+
+    labs(x=expression("log"[10]*"( Dynamicity )"),
+         y=expression("log"[10]*"( [μM] )")) +
+    theme_bw() +
+    theme(axis.text=element_text(size=22,colour="black"),
+          plot.title = element_text(size=24, hjust=0.5),
+          axis.title = element_text(size=20),
+          legend.position = "none",
+          panel.border = element_rect(linewidth=1.5),
+          panel.grid.major = element_line(color = "grey90", linewidth = 0.25),
+          panel.grid.minor = element_line(color = "grey90", linewidth = 0.25),
+          aspect.ratio = 1,
+          plot.margin = margin(t = 10, r = 0, b = 10,
+                               l = 10, unit = "pt")) +
+    coord_cartesian(ylim=c(-6,2), xlim = c(-5,0))
+
+  #-----------------------------
+  
+  deg_df <- df[df$mClass == "Deg",] %>% arrange(desc(kD))
+  deg_df["Deg_Rank"] <- seq(1, nrow(deg_df))
+  
+  non_deg_ribo <- ribo_df[!ribo_df$Protein_ID %in% deg_df$Protein_ID,]
+  # non_deg_ribo["Deg_Rank"] <- seq(nrow(deg_df) + 240, nrow(deg_df) + nrow(non_deg_ribo)+239)
+  non_deg_ribo["Deg_Rank"] <- seq(nrow(deg_df) + 100, nrow(deg_df) + nrow(non_deg_ribo)+99)
+    
+  med_ibaq_line <- deg_df %>% arrange(Deg_Rank) %>%
+    # Create a bin for every 10 ranks (1-10, 11-20, etc.)
+    # Subtracting 1 ensures rank 10 stays in the first group
+    group_by(Rank_Group = (Deg_Rank - 1) %/% 200) %>%
+    summarize(
+      Avg_Plot_iBAQ = median(Plot_iBAQ, na.rm = TRUE),
+      Median_Rank = median(Deg_Rank, na.rm = TRUE)
+    ) %>%
+    ungroup() %>%
+    select(Median_Rank, Avg_Plot_iBAQ)
+
+
+  p2 <- ggplot() +
+    annotate("rect", xmin = nrow(deg_df), xmax = 100000,
+             ymin = -1000, ymax = 1000,
+             fill = "grey80", alpha = 0.8) +
+    
+    geom_point(data=deg_df,
+               aes(y=Plot_iBAQ, x=Deg_Rank),
+               shape=1, size=3, alpha=0.3) +
+    geom_line(data=med_ibaq_line,
+              aes(x=Median_Rank, y=Avg_Plot_iBAQ, group=1),
+              linewidth=2, color="red3") +
+    
+    geom_vline(xintercept=nrow(deg_df), linetype="dashed",
+               linewidth=1) +
+
+    geom_point(data=deg_df[deg_df$Protein_ID %in% ribo_df$Protein_ID,],
+               aes(y=Plot_iBAQ, x=Deg_Rank),
+               size=3, color="#E69F00") +
+    geom_point(data=deg_df[deg_df$Protein_ID %in% ribo_df$Protein_ID,],
+               aes(y=Plot_iBAQ, x=Deg_Rank),
+               shape=1, size=3, color="black") +
+    geom_point(data=non_deg_ribo,
+               aes(y=Plot_iBAQ, x=Deg_Rank),
+               size=3, color="#E69F00") +
+    geom_point(data=non_deg_ribo,
+               aes(y=Plot_iBAQ, x=Deg_Rank),
+               shape=1, size=3, color="black") +
+
+    geom_point(data=deg_df[deg_df$Protein_ID == "XBmRNA21384|XBXL10_1g11382",],
+               aes(y=Plot_iBAQ, x=Deg_Rank),
+               size=3, color="#56B4E9") +
+    geom_point(data=deg_df[deg_df$Protein_ID == "XBmRNA21384|XBXL10_1g11382",],
+               aes(y=Plot_iBAQ, x=Deg_Rank),
+               shape=1, size=3, color="black") +    
+    
+    scale_color_manual(values=c("#5E4FA2", "grey80")) +    
+        
+    labs(x="Deg. speed (Rank 1 = fastest)",
+         y=expression("log"[10]*"( [μM] )")) +
+    theme_bw() +
+    theme(axis.text=element_text(size=22,colour="black"),
+          plot.title = element_text(size=24, hjust=0.5),
+          axis.title = element_text(size=20),
+          panel.border = element_rect(linewidth=1.25),
+          legend.position = "none",
+          panel.grid.major = element_line(color = "grey90", linewidth = 0.25),
+          panel.grid.minor = element_line(color = "grey90", linewidth = 0.25),
+          aspect.ratio = 1,
+          plot.margin = margin(t = 10, r = 25, b = 10,
+                               l = 10, unit = "pt")) +
+    coord_cartesian(ylim=c(-6,2),
+                    # xlim=c(0, nrow(deg_df) + nrow(non_deg_ribo)+240)) +
+                    xlim=c(0, nrow(deg_df) + nrow(non_deg_ribo)+100)) +    
+    # scale_x_continuous(breaks = c(1, 1000, 2000, 4000, 6000))
+    scale_x_continuous(breaks = c(1, 1000, 3000, 5000))
+
+  return(p1 | p2)
+  
+  }
+
+# #Uncomment for new image!
+# tiff("graph.tiff", units="in",
+#      width=8, height=5, res=300)
+
+dyn_ibaq_plots(frog_dyn_df, "Human_Gene")
+dyn_ibaq_plots(fly_dyn_df, "Gene_Symbol")
+
+# dev.off() #Uncomment for new image!
+
+```
+
+```{r}
+
+sessionInfo()
+
+```
+
+
+
+
+
+
+
+

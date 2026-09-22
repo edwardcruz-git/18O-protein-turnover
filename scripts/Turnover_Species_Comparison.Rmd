@@ -1,0 +1,246 @@
+---
+title: "Comparing Fly and Frog Protein Turnover"
+author: "Edward Cruz"
+date: "2025-05-08"
+output: github_document
+---
+
+
+```{r Libraries }
+
+rm(list=ls(all=T))
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(ggplot2)
+library(MASS)
+
+knitr::opts_chunk$set(fig.path = "figures/Turnover_Species_Comparison/")
+
+```
+
+
+```{r Maximum HL for frog }
+
+frog_min_kd <- log(2)/(4244*3)
+frog_max_hl <- log(2)/frog_min_kd/60
+
+```
+
+
+```{r Importing representative frog and fly fits }
+
+fly_fits <- read.csv("Files/Fits/Dyn-Model/Fly_O18_T6-7_FinalFits_ALL.csv")
+frog_fits <-read.csv("Files/Fits/Dyn-Model/XLA_O18_T5-6_FinalFits_ALL.csv")
+
+head(fly_fits)
+head(frog_fits)
+
+```
+
+
+```{r Merging single copy ortholog pairs with turnover data }
+
+frog_fits_only <- frog_fits[frog_fits$Estimate=="interval",]
+frog_fits_only <- frog_fits_only[c("Protein_ID", "XLA_Gene", "kD",
+                                   "HL_Hrs", "mClass")]
+colnames(frog_fits_only)[5] <- "Frog_Class"
+
+fly_fits_only <- fly_fits[fly_fits$Estimate=="interval",]
+fly_fits_only <- fly_fits_only[c("Protein_ID", "Gene_Symbol", "kD",
+                                 "HL_Hrs")]
+colnames(fly_fits_only)[2] <- "Fly_Gene"
+
+#----------------------------------
+
+sc_df <- read.csv("Data/XLA-Dmel_orthologue_pairs.csv")
+colnames(sc_df) <- c("Fly_ID", "Frog_ID")
+sc_df["Fly_ID"] <- sapply(strsplit(sc_df$Fly_ID, split = "\\|"), "[", 2)
+
+sc_df <- merge(sc_df, fly_fits_only,
+               by.x = "Fly_ID", by.y="Protein_ID")
+sc_df <- merge(sc_df, frog_fits_only,
+               by.x = "Frog_ID", by.y="Protein_ID",
+               suffixes = c("_Fly", "_Frog"))
+
+sc_df <- sc_df %>%
+  dplyr::select(Frog_ID, Fly_ID, XLA_Gene, Fly_Gene, everything()) %>%
+  arrange(desc(kD_Frog))
+
+head(sc_df) 
+
+```
+
+
+```{r Histograms comparing all frog and fly single-copy half-lives }
+
+paired_kd_comp <- data.frame(kD=c(sc_df$kD_Fly,
+                                  sc_df$kD_Frog),
+                             Group=c(rep("Fly", nrow(sc_df)),
+                                     rep("Frog", nrow(sc_df))))
+# paired_kd_comp <- data.frame(kD=c(fly_fits$kD,
+#                                   frog_fits$kD),
+#                              Group=c(rep("Fly", nrow(fly_fits)),
+#                                      rep("Frog", nrow(frog_fits))))
+paired_kd_comp["Plot_kD"] <- paired_kd_comp$kD
+paired_kd_comp[paired_kd_comp$kD > 0.001, "Plot_kD"] <- 0.001
+
+#Define exact bin edges to guarantee the bars and the outline align perfectly
+bw <- 0.000025
+brks <- seq(-0.001, 0.002 + bw, by = bw)
+
+#Calculate half-life x-intercepts (kd = ln(2) / minutes)
+kd_1day <- log(2) / (24 * 60)
+kd_12hr <- log(2) / (12 * 60)
+kd_6hr  <- log(2) / (6 * 60)
+
+comp_kd_pdf <- ggplot(paired_kd_comp,
+                      aes(x = Plot_kD, fill = Group,
+                          color = Group)) +
+  # after_stat(density) normalizes the area to 1
+  # position = "identity" prevents stacking so they overlap naturally
+  geom_histogram(aes(y = after_stat(count / sum(count))), 
+                 breaks = brks, position = "identity", 
+                 alpha=0.7, color=NA) +
+  
+  # ONLY draws an outline for "Deg"
+  geom_step(aes(y = after_stat(count / sum(count))),
+            stat = "bin", breaks = brks, direction = "mid",
+            linewidth = 1, show.legend = FALSE) +
+  
+  geom_vline(xintercept = c(kd_1day, kd_12hr, kd_6hr),
+             linetype = "dashed", color = "black", 
+             linewidth = 1) +
+  
+  scale_fill_manual(values = c("Fly" = "#CC79A7", "Frog" = "#E69F00")) +
+  scale_color_manual(values = c("Fly" = "#CC79A7", "Frog" = "#E69F00")) +
+
+  # LABELS & THEME: Matching your reference image
+  labs(x = expression("k"["d"]~"(min"^{-1}*")"), y = "Density") +
+  theme_bw() +
+  theme(axis.text.y=element_text(size=20,colour="black"),
+        axis.text.x=element_text(size=18,colour="black", angle=45,
+                                 hjust=1),
+        plot.title = element_text(size=24, hjust=0.5),
+        axis.title = element_text(size=18),
+        panel.border = element_rect(linewidth=1.5),
+        legend.position = "none",
+        panel.grid.major = element_line(color = "grey90", linewidth = 0.25),
+        panel.grid.minor = element_line(color = "grey90", linewidth = 0.25),
+        plot.margin = margin(t = 10, r = 25, b = 10,
+                             l = 10, unit = "pt")) +
+  coord_cartesian(xlim=c(0, 0.001)) +
+  scale_x_continuous(breaks=c(0, 0.00025, 0.0005, 0.00075, 0.001),
+                     labels=c("0", "0.00025", "0.0005",
+                              "0.00075", "0.001"))
+
+median(paired_kd_comp[paired_kd_comp$Group=="Frog",]$kD)
+median(paired_kd_comp[paired_kd_comp$Group=="Fly",]$kD)
+
+# #Uncomment for new image!
+# tiff("graph.tiff", units="in",
+#      width=6, height=3.5, res=300)
+
+comp_kd_pdf
+
+# dev.off() #Uncomment for new image!
+
+```
+
+
+```{r Fitting slope through single-copy orthologes }
+
+# Fit a robust linear model forcing a zero intercept (y = mx)
+# In this formula, '0 +' tells R to remove the intercept term.
+robust_ortho <- rlm(HL_Hrs_Frog ~ 0 + HL_Hrs_Fly, data = sc_df)
+
+# Extract just the slope coefficient
+robust_ortho <- coef(robust_ortho)[1]
+print(paste("The robust slope (m) is:", round(robust_ortho, 1)))
+
+```
+
+
+```{r Biplot of frog and fly half-lives }
+
+p1 <- ggplot() +
+  geom_point(data=sc_df, aes(x=HL_Hrs_Fly, y=HL_Hrs_Frog),
+             size=3, shape=1, stroke=1) +
+  geom_abline(slope=1, intercept=0, color="black",
+              linetype="dashed", linewidth=1) +
+  geom_abline(slope=robust_ortho, intercept=0, color="red2",
+              linetype="dashed", linewidth=1) +
+
+  labs(x="Fly half-life (Hrs)", y="Frog half-life (Hrs)") +
+  theme_bw() +
+  theme(axis.text=element_text(size=21,colour="black"),
+        plot.title = element_text(size=24, hjust=0.5),
+        axis.title = element_text(size=20),
+        panel.border = element_rect(linewidth=1.25),
+        panel.grid.major = element_line(color = "grey70", linewidth = 0.25),
+        panel.grid.minor = element_line(color = "grey70", linewidth = 0.25),
+        aspect.ratio = 1,
+        legend.position = "none",
+        plot.margin = margin(t = 5, r = 10, b = 5,
+                             l = 5, unit = "pt")) +
+  coord_cartesian(xlim=c(0,frog_max_hl), ylim=c(0,frog_max_hl))
+
+# #Uncomment for new image!
+# tiff("graph.tiff", units="in",
+#      width=4, height=4, res=300)
+
+p1
+
+# dev.off() #Uncomment for new image!
+
+```
+
+
+```{r Violin plot of single-copy pair fold-change }
+
+hl_ratio <- sc_df
+hl_ratio["Ratio_HL"] <- hl_ratio$HL_Hrs_Frog / hl_ratio$HL_Hrs_Fly
+hl_ratio[hl_ratio$Ratio_HL > 20, "Ratio_HL"] <- 20
+
+comp_violin <- ggplot(hl_ratio,
+                      aes(x = "", y = Ratio_HL)) +
+  geom_violin(fill = "grey70") +
+  labs(x=paste("Median:",
+               round(median(hl_ratio$Ratio_HL), 1)),
+       y="Frog / fly half-life FC") +
+
+  stat_summary(fun = median, geom = "point", shape = 23,
+               size = 3, fill = "black") +  # Add median
+  stat_summary(fun.data = function(y) { data.frame(y = median(y),
+                                                   ymin = quantile(y, 0.25),
+                                                   ymax = quantile(y, 0.75))},
+               geom = "errorbar", width = 0.1) +  # Add IQR
+  theme_bw() +
+  theme(#aspect.ratio = 1,
+        plot.title = element_text(size=20,colour="black"),
+        axis.text=element_text(size=20,colour="black"),
+        axis.title.x=element_text(size=20,colour="black"),
+        axis.title.y=element_text(size=20,colour="black"),
+        panel.border = element_rect(linewidth=1.25))
+  # coord_cartesian(ylim=c(0,100))
+
+# #Uncomment for new image!
+# tiff("graph.tiff", units="in",
+#      width=2.55, height=4, res=300)
+
+comp_violin
+
+# dev.off() #Uncomment for new image!
+
+```
+
+
+```{r}
+
+sessionInfo()
+
+```
+
+
+
+

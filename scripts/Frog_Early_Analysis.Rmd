@@ -1,0 +1,825 @@
+---
+title: "Frog Early Analysis"
+output: github_document
+date: "2026-01-07"
+---
+
+
+```{r Libraries }
+
+rm(list=ls(all=T))
+library(lsa)
+library(ggplot2)
+library(fgsea)
+library(stats)
+library(GO.db)
+library(tidyr)
+library(dplyr)
+library(stringr)
+library(KEGGREST)
+library(rrvgo)
+library(org.Hs.eg.db)
+library(clusterProfiler)
+library(minpack.lm)
+library(Biostrings)
+library(Peptides)
+library(ggpubr)
+library(forcats)
+library(effsize)
+library(patchwork)
+
+knitr::opts_chunk$set(fig.path = "figures/Frog_Early_Analysis/")
+
+```
+
+
+```{r Importing data from other scripts }
+
+Frog_T5_all.min <- c(161, 221, 281, 401, 521, 641,
+                     881, 1605, 1961, 2918, 4405) - 161
+Frog_T5_light.min <- Frog_T5_all.min[c(1:2, 4:5, 7:8, 10:11)]
+
+Frog_T6_all.min <- c(150, 210, 270, 390, 510, 635,
+                     930, 1591, 1950, 2910, 4394) - 150
+Frog_T6_light.min <- Frog_T6_all.min[c(1:2, 4:5, 7:8, 10:11)]
+
+avg_light_time <- (Frog_T5_light.min + Frog_T6_light.min)/2
+avg_heavy_time <- (Frog_T5_all.min + Frog_T6_all.min)/2
+
+light.channels <- c("T0_L", "N1", "N3", "N4",
+                    "N7", "N9",  "N11", "N12")
+heavy.channels <- c("T0_H", "O1", "O2", "O3", "O4", "O5",
+                    "O7", "O9", "O10", "O11", "O12")
+
+XLA_fits_df <- read.csv("Files/Fits/Dyn-Model/XLA_O18_T5-6_FinalFits_ALL.csv")
+head(XLA_fits_df)
+
+```
+
+
+```{r Calculating 2C precision limits }
+
+max_fit_kd <- log(2)/(tail(avg_heavy_time, 1)*3)
+max_fit_hl <- log(2)/max_fit_kd/60
+
+cat("Max Half-life (hrs):\t", max_fit_hl) 
+
+```
+
+
+```{r Reference human map }
+
+human_map <- read.csv("Files/Reference/Xen10_to_Human_Name_Assign.csv")
+human_map["Protein_ID"] <- sapply(human_map$Protein_ID, function(x){
+  split_id <- strsplit(x, "\\|")[[1]]
+  reformat <- paste0(split_id[3], "|", split_id[2])
+
+  return(reformat) })
+
+human_map <- human_map[human_map$Protein_ID %in% XLA_fits_df$Protein_ID,]
+head(human_map)
+
+```
+
+
+```{r Setting rank order for GO-term enrichment }
+
+enrich_kd <- XLA_fits_df[XLA_fits_df$Protein_ID %in% human_map$Protein_ID,
+                         c("Protein_ID", "kD", "O12")]
+enrich_kd <- enrich_kd %>% arrange(kD, desc(O12))
+
+enrich_kd["Rank"] <- seq(1, nrow(enrich_kd))
+enrich_kd["Signed_Rank"] <- enrich_kd$Rank - mean(enrich_kd$Rank)
+enrich_kd["Signed_Rank"] <- enrich_kd$Signed_Rank / max(enrich_kd$Signed_Rank)
+enrich_kd <- enrich_kd %>%
+  select(Signed_Rank, Protein_ID, kD) %>%
+  arrange(desc(Signed_Rank))
+
+protein_stats <- setNames(enrich_kd$Signed_Rank, enrich_kd$Protein_ID)
+
+head(protein_stats)
+cat("\n\n")
+tail(protein_stats)
+
+```
+
+
+```{r Mapping human GO terms }
+
+human_GO <- human_map
+human_GO <- apply(human_GO, 1, function(x){
+
+  BP_terms <- trimws(strsplit(x["GO_BP"], ";")[[1]])
+  BP_id <- sub(".*\\[(GO:\\d+)\\].*", "\\1", BP_terms)
+  BP_desc <- sub("\\s*\\[GO:.*\\]", "", BP_terms)
+
+  MF_terms <- trimws(strsplit(x["GO_MF"], ";")[[1]])
+  MF_id <- sub(".*\\[(GO:\\d+)\\].*", "\\1", MF_terms)
+  MF_desc <- sub("\\s*\\[GO:.*\\]", "", MF_terms)
+
+  CC_terms <- trimws(strsplit(x["GO_CC"], ";")[[1]])
+  CC_id <- sub(".*\\[(GO:\\d+)\\].*", "\\1", CC_terms)
+  CC_desc <- sub("\\s*\\[GO:.*\\]", "", CC_terms)
+
+
+  out_df <- data.frame(Protein_ID=rep(x["Protein_ID"],
+                                      length(c(BP_id, MF_id, CC_id))),
+                       ID=c(BP_id, MF_id, CC_id),
+                       Desc=c(BP_desc, MF_desc, CC_desc),
+                       Type=c(rep("BP", length(BP_id)),
+                              rep("MF", length(MF_id)),
+                              rep("CC", length(CC_id))))
+
+  return(out_df) }) %>% bind_rows
+
+#This dataframe is solely to count terms and remove <10 annotations
+human_GO_counts <- data.frame(table(human_GO$ID))
+human_GO_counts <- human_GO_counts[human_GO_counts$Freq > 20,]
+
+#df of GO terms for identified and mapped proteins
+human_GO_annot <- unique(human_GO[c("ID", "Type", "Desc")])
+human_GO_annot <- human_GO_annot[human_GO_annot$ID %in% human_GO_counts$Var1,]
+row.names(human_GO_annot) <- NULL
+
+head(human_GO_annot)
+
+```
+
+
+```{r Filtering human GO data }
+
+filtered_human_GO <- human_GO
+filtered_human_GO <- filtered_human_GO[filtered_human_GO$ID %in% human_GO_annot$ID,]
+
+human_GO_ref <- lapply(unique(filtered_human_GO$ID),
+       function(x){
+
+         term <- human_GO[human_GO$ID == x,]$Protein_ID
+
+         return(term) })
+
+names(human_GO_ref) <- unique(filtered_human_GO$ID)
+
+human_GO_ref[1]
+
+```
+
+
+```{r Enrichment test }
+
+# Run enrichment
+res <- fgseaMultilevel(
+  pathways = human_GO_ref, #Human GO
+  stats    = protein_stats,
+  minSize  = 10,
+  maxSize  = 500)
+
+#Order your results by significance
+res <- res[order(res$padj), ]
+
+# fgsea's built-in collapsing function
+# Compares the leading edge genes of nested pathways and drops redundant ones
+collapsed_pathways <- collapsePathways(res, human_GO_ref, protein_stats)
+
+#Filter main results to keep only the 'parent' representative terms
+res <- res[res$pathway %in% collapsed_pathways$mainPathways, ]
+res <- res[res$padj < 0.05,] %>% as.data.frame
+res <- merge(res, human_GO_annot, by.x="pathway",  by.y="ID")
+res <- res %>% arrange(desc(NES))
+res <- res[c("pathway", "NES", "padj", "size", "Type", "Desc")]
+
+head(res)
+
+```
+
+
+```{r Selecting representative GO terms }
+
+custom_GO_terms <- human_GO_annot[human_GO_annot$ID %in% 
+  c("GO:0051301", "GO:0000981", "GO:0004712", "GO:0061630", "GO:0098609",
+    "GO:0005759", "GO:0006457", "GO:0005840", "GO:0006635", "GO:0000502",
+    "GO:0008017"),]
+custom_GO_terms <- custom_GO_terms[order(custom_GO_terms$ID),]
+
+custom_GO_terms["Custom_Name"] <-
+  c("Proteasome complex", "Transcription factor activity", "Protein kinase activity",
+    "Mitochondrial matrix", "Ribosome", "Protein folding", "Fatty acid β-oxidation",
+    "Microtubule binding",
+    "Cell division", "Ubiquitin protein ligase activity", "Cell-cell adhesion")
+custom_GO_terms <- custom_GO_terms[-c(2,3)]
+custom_GO_terms <- merge(res, custom_GO_terms,
+                         by.x="pathway", by.y="ID") %>% arrange(desc(NES))
+
+custom_GO_terms
+
+```
+
+
+```{r GO term plot }
+
+p1 <- ggplot(custom_GO_terms, aes(x = NES, size = size,
+                                  y = reorder(Custom_Name, NES))) +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  geom_point(alpha = 1) +
+  geom_point(shape = 1, color = "black", stroke=0.8) +
+  scale_y_discrete(labels = function(x) str_wrap(x, width = 50)) +  # wrap for display only
+  scale_color_continuous(low = "grey80", high = "grey30", trans = "reverse") +
+  labs(
+    x = "Normalized enrichment score",
+    y = "GO term",
+    size = "Set size"
+  ) +
+  theme_bw() +
+  theme(
+    legend.text = element_text(size = 12, colour = "black"),
+    legend.title = element_text(size = 12, colour = "black"),    
+    axis.text = element_text(size = 13, colour = "black"),    
+    plot.title = element_text(size = 18, hjust = 0.5),
+    axis.title.x = element_text(size=16),
+    axis.title.y = element_blank(),    
+    panel.border = element_rect(linewidth = 1),
+    plot.margin = margin(t = 5, r = 10, b = 15, l = 7, unit = "pt"),
+    legend.position = c(0.25,0.75),
+    legend.background = element_rect(colour = "black", linewidth = 0.5,
+                                     fill = "white")
+  ) +
+  coord_cartesian(xlim=c(-3.25,3.25))
+
+# #Uncomment for new image!
+# tiff("graph.tiff", units="in",
+#      width=6, height=4, res=300)
+
+p1
+
+# dev.off() #Uncomment for new image!
+
+```
+
+
+```{r Importing interproscan data }
+
+XLA_deg_proteins <- XLA_fits_df$Protein_ID
+
+interproscan_XLA <- 
+  read.csv("Systems/Frog_Interproscan/XLA_10p1_longest-transcript_interproscan.tsv",
+           sep="\t")
+interproscan_XLA <- interproscan_XLA[interproscan_XLA$Protein_ID %in%
+                                       XLA_deg_proteins,]
+interproscan_XLA <- unique(interproscan_XLA[c("Protein_ID", "Signature_Accession",
+                                              "Signature_Description")])
+
+sub_IP_XLA <- data.frame(table(interproscan_XLA$Signature_Accession)) %>%
+  arrange(Freq)
+sub_IP_XLA <- sub_IP_XLA[sub_IP_XLA$Freq>=5,]$Var1
+sub_IP_XLA <- sapply(sub_IP_XLA, as.character)
+
+length(sub_IP_XLA)
+sub_IP_XLA[1:10]
+
+```
+
+
+```{r Combinding deg rates with domain data }
+
+domain_sub <- XLA_fits_df[c("Protein_ID", "XLA_Gene", "Human_Gene",
+                            "kD", "HL_Hrs", "mClass")]
+domain_sub <- merge(domain_sub,
+                    interproscan_XLA[c("Protein_ID", "Signature_Accession",
+                                       "Signature_Description")],
+                    by="Protein_ID") %>% arrange(HL_Hrs)
+# domain_sub <-  domain_sub[domain_sub$Signature_Accession %in%
+#                             sub_IP_XLA,] %>% arrange(desc(Avg_kD))
+
+head(domain_sub)
+
+```
+
+
+
+```{r Selecting PFAM domains of interest }
+
+pfam_domains <- c("PF00225", "PF01437", "PF00096", "PF00595", "PF00567",
+                  "PF02984", "PF00028", "PF00176", "PF02207", "PF00439",
+                  "PF13445", "PF00632", "PF00069", "PF07525", "PF00046", 
+                  "PF00022", "PF00472", "PF00191", "PF01399", "PF00012",
+                  "PF00227", "PF00118", "PF00106")
+
+names(pfam_domains) <-
+  c("Kinesin motor", "Plexin repeat", "Znf-C2H2", "PDZ", "Tudor",
+    "Cyclin-Cterm", "Cadherin", "SNF2-related", "UBR box", "Bromo",
+    "RING-Znf", "HECT", "Protein kinase", "SOCS box", "Homeo",
+    "Actin", "RF-1", "Annexin", "PCI", "Hsp70",
+    "Proteasome subunit", "TCP1-cnp60 chaperonin", "Short chain dehydrogenase")
+
+```
+
+
+```{r Interesting cell adhesion proteins }
+
+domain_sub[domain_sub$Signature_Accession == "PF00028",]
+
+```
+
+
+```{r Reorganizing domain data for plotting }
+
+domain_all_data <- lapply(pfam_domains, function(pfam){
+
+  sub_df <- domain_sub[domain_sub$Signature_Accession == pfam,]
+  sub_df$Signature_Description <- rep(names(pfam_domains[pfam_domains==pfam]),
+                                      nrow(sub_df))
+
+  return(sub_df)}) %>% bind_rows
+domain_all_data <- domain_all_data[domain_all_data$Signature_Accession %in% sub_IP_XLA,]
+
+domain_all_data <- domain_all_data[!domain_all_data$Signature_Description %in%
+    c("Actin", "RF-1", "Annexin", "Hsp70", "Proteasome subunit",
+      "TCP1-cnp60 chaperonin", "Short chain dehydrogenase"),]
+
+head(domain_all_data)
+
+```
+
+
+```{r Domain plot }
+
+domain_all_data["Signature_Description"] <-
+  factor(domain_all_data$Signature_Description,
+         levels=c("PCI", "Protein kinase", "HECT", "Bromo",
+                  "PDZ", "Homeo", "SNF2-related", "RING-Znf",
+                  "Znf-C2H2", "Tudor", "UBR box", "Kinesin motor",
+                  "SOCS box", "Cadherin", "Plexin repeat", "Cyclin-Cterm"))
+
+deg_domains <- ggplot(domain_all_data, aes(x = Signature_Description,
+                                           y = HL_Hrs)) +
+
+  # geom_hline(yintercept = max_fit_hl, linetype = "dashed",
+  #            color = "black", linewidth=1) +
+  geom_boxplot(outliers = FALSE, fill = "grey90", color = "black", alpha = 0.7) +
+  stat_summary(fun = median, geom = "point", 
+               shape = 21, size = 3, fill = "red3", color = "black") +
+  labs(title = "Protein Half-Lives by InterPro Domain",
+       x = "Protein domain", y = "Half-life (hours)") +
+  theme_bw() +
+  theme(axis.text.x = element_text(size = 15,colour="black",
+                                   angle=35, hjust=1),
+        axis.title.x = element_blank(),
+        axis.text.y = element_text(size=16,colour="black"),
+        axis.title.y = element_text(size=16),
+        plot.title = element_blank(),
+        panel.border = element_rect(linewidth=1.1),
+        panel.grid.major = element_line(color = "grey90", linewidth = 0.25),
+        panel.grid.minor = element_line(color = "grey90", linewidth = 0.25),
+        legend.position = "none",
+        plot.margin = margin(t = 10, r = 25, b = 10,
+                             l = 10, unit = "pt")) 
+
+# #Uncomment for new image!
+# tiff("graph.tiff", units="in",
+#      width=9, height=4.25, res=300)
+
+deg_domains
+
+# dev.off() #Uncomment for new image!
+
+```
+
+
+```{r Importing IUPred data for disorder analysis }
+
+XLA_iupred <- read.csv("Systems/iupred2a/XLA_10p1_IUPred2A-results.csv")
+
+XLA_idr_res <- XLA_fits_df[c("Protein_ID", "XLA_Gene", "Human_Gene",
+                             "kD", "HL_Hrs", "mClass")]
+XLA_idr_res <- merge(XLA_idr_res, XLA_iupred, by="Protein_ID") %>%
+  arrange(desc(kD))
+
+XLA_idr_res["IDR_Class"] <- "N/A"
+XLA_idr_res[XLA_idr_res$Mean_IUPred>=0.5,"IDR_Class"] <- "Disordered"
+XLA_idr_res[XLA_idr_res$Mean_IUPred<0.5,"IDR_Class"] <- "Ordered"
+
+# --- Are disordered proteins more likely to be degrading AT ALL? ------------
+XLA_idr_res$IDR_Class <- factor(XLA_idr_res$IDR_Class,
+                                levels = c("Ordered", "Disordered"))
+
+prop_tab <- table(IDR_Class = XLA_idr_res$IDR_Class,
+                  Degrading = XLA_idr_res$mClass)
+
+# chi-square (Fisher is needlessly slow at this n; result is identical in spirit)
+prop_test <- chisq.test(prop_tab)
+
+print(prop_test)
+cat("\n\n\n")
+
+# --- AMONG degraders, do disordered ones degrade faster? ------------
+
+deg <- XLA_idr_res %>% filter(mClass=="Deg") 
+
+rate_test <- t.test(log10(kD) ~ IDR_Class, data = deg)
+print(rate_test)
+
+```
+
+
+```{r Disorder domain plotting for bottom }
+
+IDR_boxplot_df <- cbind(XLA_idr_res[c("IDR_Class", "HL_Hrs")],
+                        data.frame(Set=rep("All", nrow(XLA_idr_res))))
+IDR_boxplot_df <- rbind(IDR_boxplot_df,
+                        cbind(deg[c("IDR_Class", "HL_Hrs")],
+                              data.frame(Set=rep("Degrading", nrow(deg)))))
+
+p1 <- ggplot(IDR_boxplot_df,
+             aes(x = IDR_Class, y = HL_Hrs, fill = Set,
+                 group=interaction(IDR_Class, Set))) +
+  geom_boxplot(width = 0.5, color = "black",
+               outliers = FALSE, alpha=0.7,
+               position=position_dodge(width = 0.6)) +
+  stat_summary(fun = median, geom = "point",
+               shape = 21, size = 3, fill = "red3", color = "black",
+               position = position_dodge(width = 0.6)) +
+  scale_fill_manual(values = c(All = "#D55E00", Degrading = "#5E4FA2")) +
+  theme_bw() +
+  theme(axis.text.y = element_text(size=16, colour="black"),
+        axis.text.x = element_text(size = 15, colour="black"),
+        axis.title.y = element_text(size=16),
+        axis.title.x = element_blank(),
+        plot.title = element_blank(),
+        panel.border = element_rect(linewidth=1.2),
+        panel.grid.major = element_line(color = "grey90", linewidth = 0.25),
+        panel.grid.minor = element_line(color = "grey90", linewidth = 0.25),
+        legend.position = "none",
+        plot.margin = margin(t = 0, r = 25, b = 0, l = 10, unit = "pt")) +
+  labs(y=expression("Half-life (hours)")) +
+  coord_cartesian(ylim=c(0,210)) +
+  scale_y_continuous(breaks=c(0, 50, 100, 150, 200))
+
+```
+
+
+```{r Final disorder plot }
+
+dist_idr_df <- 
+  rbind(data.frame(table(XLA_idr_res[XLA_idr_res$IDR_Class=="Ordered",]$mClass)),
+        data.frame(table(XLA_idr_res[XLA_idr_res$IDR_Class=="Disordered",]$mClass)))
+dist_idr_df["IDR"] <- c("Ordered", "Ordered", "Disordered", "Disordered")
+dist_idr_df[1:2, "Freq"] <- dist_idr_df$Freq[1:2] / 7617
+dist_idr_df[3:4, "Freq"] <- dist_idr_df$Freq[3:4] / 1187
+dist_idr_df$IDR <- factor(dist_idr_df$IDR, levels=c("Ordered", "Disordered"))
+dist_idr_df$Var1 <- factor(dist_idr_df$Var1, levels=c("Flat", "Deg"))
+
+dist_idr_df
+
+p2 <- ggplot(dist_idr_df, aes(x = IDR, y = Freq*100, fill = Var1)) +
+  geom_col(width = 0.6, colour = "black", alpha=0.7) +
+  scale_fill_manual(values = c(Deg = "#5E4FA2",
+                               Flat = "#767676"),
+                    labels = c("No measurable degradation", "Degrading")) +
+  labs(y = "% of prot.") +
+  theme_bw() +
+  theme(axis.text.x  = element_blank(),
+        axis.ticks.x = element_blank(),
+        axis.title.x = element_blank(),
+        axis.text.y  = element_text(size = 16, colour = "black"),
+        axis.title.y = element_text(size = 16),
+        panel.border = element_rect(linewidth = 1.2),
+        panel.grid.minor = element_blank(),
+        legend.position = "none",
+        legend.text = element_text(size = 14),
+        legend.title = element_blank(),
+        plot.margin = margin(t = 0, r = 25,
+                             b = 0, l = 0, unit = "pt")) +
+  scale_y_continuous(breaks = c(0,50,100), expand = expansion(mult = c(0, 0)))
+
+
+# --- stack, aligned x-axis ---
+p_combined <- p2 / p1 + plot_layout(heights = c(1, 2.5))
+
+# #Uncomment for new image!
+# tiff("graph.tiff", units="in",
+#      width=4, height=3.5, res=300)
+
+p_combined
+
+# dev.off() #Uncomment for new image!
+
+```
+
+
+```{r Binning data for compartment analysis }
+
+target_bins <- data.frame(
+  Macro_Compartment = c("Nucleus", "Cytoplasm", "Mitochondrion", "Endoplasmic reticulum", 
+                        "Plasma membrane", "Golgi apparatus", "Extracellular region", 
+                        "Chromatin", "Vesicle"),
+  Macro_GO_ID = c("GO:0005634", "GO:0005737", "GO:0005739", "GO:0005783", 
+                  "GO:0005886", "GO:0005794", "GO:0005576", 
+                  "GO:0000785", "GO:0031982"))
+
+#---------------------------
+
+offspring_map <- as.list(GOCCOFFSPRING[target_bins$Macro_GO_ID])
+
+mapping_df <- lapply(names(offspring_map),
+                               function(parent_id) {
+  data.frame(Macro_GO_ID = parent_id,
+             Specific_GO_ID = offspring_map[[parent_id]],
+             stringsAsFactors = FALSE) }) %>% bind_rows
+
+mapping_df <- rbind(data.frame(Macro_GO_ID = target_bins$Macro_GO_ID,
+                               Specific_GO_ID = target_bins$Macro_GO_ID),
+                    mapping_df)
+
+mapping_df <- merge(mapping_df, target_bins, by="Macro_GO_ID")
+head(mapping_df)
+
+```
+
+
+```{r Reoganizing data for compartment analysis }
+
+XLA_macro_CC <- XLA_fits_df[c("Protein_ID", "XLA_Gene", "Human_Gene",
+                              "kD", "HL_Hrs", "mClass")]
+XLA_macro_CC <- merge(XLA_macro_CC,
+                      unique(human_GO[c("Protein_ID", "ID")]),
+                      by="Protein_ID")
+XLA_macro_CC <- XLA_macro_CC[XLA_macro_CC$ID %in%
+                               mapping_df$Specific_GO_ID,]
+XLA_macro_CC <- merge(XLA_macro_CC, mapping_df[2:3],
+                      by.x="ID", by.y="Specific_GO_ID")
+XLA_macro_CC["ID"] <- NULL
+XLA_macro_CC <- unique(XLA_macro_CC) %>% arrange(Protein_ID)
+
+CC_prot_counts <- data.frame(table(XLA_macro_CC$Protein_ID))
+
+XLA_macro_CC <- XLA_macro_CC[XLA_macro_CC$Protein_ID %in%
+                               CC_prot_counts[CC_prot_counts$Freq<=2,]$Var1,]
+
+all_prot_CC <- unique(XLA_macro_CC[-7])
+all_prot_CC["Macro_Compartment"] <- "All proteins"
+
+XLA_macro_CC <- rbind(XLA_macro_CC, all_prot_CC)
+
+head(XLA_macro_CC)
+
+```
+
+
+```{r Ordering compartment data }
+
+CC_ordering <- lapply(unique(XLA_macro_CC$Macro_Compartment),
+       function(x){
+         
+         sub_df <- XLA_macro_CC[XLA_macro_CC$Macro_Compartment == x,]
+         
+         max_hl_rows <- nrow(sub_df[sub_df$HL_Hrs == max_fit_hl,])
+
+         percent_collapsed <- max_hl_rows/nrow(sub_df)
+         median_hl <- median(sub_df$HL_Hrs)
+          
+         out_line <- data.frame(CC=x, HL=median_hl,
+                                Collapse_Percent = round(percent_collapsed*100,0),
+                                Deg_Percent = 100-round(percent_collapsed*100,0))
+
+         return(out_line) }) %>% bind_rows %>%
+  arrange(CC != "All proteins", -HL, -Collapse_Percent)
+
+XLA_macro_CC$Macro_Compartment <- factor(XLA_macro_CC$Macro_Compartment,
+                                         levels=CC_ordering$CC)
+
+CC_ordering
+
+```
+
+
+```{r Bottom of Compartment plot }
+
+p_kd_CC <- ggplot(data=XLA_macro_CC,
+                  aes(x = Macro_Compartment, y = HL_Hrs)) +
+
+  geom_boxplot(outliers=FALSE, width = 0.7, color = "black", fill = "#5E4FA2", alpha=0.7) +
+  
+  geom_vline(xintercept = 1.5, linetype="dashed",
+             color = "black", linewidth = 1) +
+
+  stat_summary(fun = median, geom = "point", 
+               shape = 21, size = 3, fill = "red3", color = "black") +
+
+  # geom_text(data = CC_ordering,
+  #           aes(x = CC, y = max_fit_hl, label = paste0(Deg_Percent, "%")),
+  #           vjust = -0.6, size = 5, inherit.aes = FALSE) +
+    
+  theme_bw() +
+  labs(x = "Cellular Compartment",
+       y = "Half-life (hours)") +
+  
+  theme(axis.text.x = element_text(angle = 35, size=15, hjust = 1, colour="black"),
+        axis.title.x = element_blank(),
+        axis.text.y = element_text(size=16,colour="black"),
+        axis.title.y = element_text(size=16, hjust=0.2),        
+        plot.title = element_blank(),
+        panel.border = element_rect(linewidth=1.2),
+        panel.grid.major = element_line(color = "grey90", linewidth = 0.25),
+        panel.grid.minor = element_line(color = "grey90", linewidth = 0.25),
+        plot.margin = margin(t = 10, r = 25, b = 10,
+                             l = 10, unit = "pt")) +
+  coord_cartesian(ylim = c(0,230)) +
+  scale_y_continuous(breaks=seq(0,200,50))
+  
+p_kd_CC
+
+```
+
+
+```{r Complete compartment plot }
+
+prop_df <- CC_ordering %>%
+  pivot_longer(cols = -c(CC, HL),
+               names_to = "Type",
+               values_to = "Percent")
+prop_df$CC <- factor(prop_df$CC, levels=CC_ordering$CC)
+
+# --- top track: 100% stacked proportion bar ---
+p_bar <- ggplot(prop_df, aes(x = CC, y = Percent, fill = Type)) +
+  geom_col(width = 0.7, colour = "black", alpha=0.7) +
+  geom_vline(xintercept = 1.5, linetype = "dashed", colour = "black", linewidth = 1) +
+  scale_fill_manual(values = c(Deg_Percent = "#5E4FA2",
+                               Collapse_Percent = "#767676"),
+                    labels = c("No measurable degradation", "Degrading")) +
+  labs(y = "% of prot.") +
+  theme_bw() +
+  theme(axis.text.x  = element_blank(),
+        axis.ticks.x = element_blank(),
+        axis.title.x = element_blank(),
+        axis.text.y  = element_text(size = 16, colour = "black"),
+        axis.title.y = element_text(size = 16),
+        panel.border = element_rect(linewidth = 1.2),
+        panel.grid.minor = element_blank(),
+        legend.position = "none",
+        legend.text = element_text(size = 16),
+        legend.title = element_blank(),
+        plot.margin = margin(t = 15, r = 25,
+                             b = 0, l = 0, unit = "pt")) +
+  scale_y_continuous(breaks = c(0,50,100), expand = expansion(mult = c(0, 0)))
+
+# --- bottom: your existing boxplot, x-title/labels live here ---
+p_box <- p_kd_CC + theme(plot.margin = margin(t = 0, r = 25, b = 0, l = 10, unit = "pt"))
+
+# --- stack, aligned x-axis ---
+p_combined <- p_bar / p_box + plot_layout(heights = c(1, 4.3))
+
+# #Uncomment for new image!
+# tiff("graph.tiff", units="in",
+#      width=8, height=5, res=300)
+
+p_combined
+
+# dev.off() #Uncomment for new image!
+
+```
+
+
+```{r Importing data used for normalization }
+
+norm_set <- read.csv("Data/XLA_Norm/XLA-O18_YolkNormSet_T8-NYS-Decay.csv")$Protein_ID
+
+```
+
+
+```{r Determining grouped class for each protein }
+
+all_tracks_df <- XLA_fits_df
+all_tracks_df["Light_FC"] <- apply(all_tracks_df, 1, function(row){
+  
+  light_fc <- as.numeric(row["N12"]) / as.numeric(row["T0_L"])
+  
+  return(light_fc) })
+
+inc_min_fc <- quantile(all_tracks_df[all_tracks_df$Protein_ID %in% norm_set,]$Light_FC, 0.99)
+dec_min_fc <- quantile(all_tracks_df[all_tracks_df$Protein_ID %in% norm_set,]$Light_FC, 0.01)
+
+inc_min_fc
+dec_min_fc
+
+all_tracks_df["Light_Type"] <- rep("Unchanging", nrow(all_tracks_df))
+all_tracks_df[all_tracks_df$Light_FC > inc_min_fc, "Light_Type"] <- "Increasing"
+all_tracks_df[all_tracks_df$Light_FC < dec_min_fc, "Light_Type"] <- "Decreasing"
+
+all_tracks_df["Merged_Class"] <- paste0(all_tracks_df$Light_Type, "_", all_tracks_df$mClass)
+
+table(all_tracks_df$Merged_Class)
+
+```
+
+
+```{r Pie chart of kinetic classes }
+
+summary.data <- data.frame(
+  category = c("No measurable degradation", "Balanced Protein Turnover",
+               "Protein Degradation Only", "Net Protein Increase with Degradation",
+               "Protein Synthesis Only"),
+  count = c(2512+30, 709, 258, 1605, 3692))
+
+sum(summary.data$count)
+summary.data$category
+cat("\n")
+round(summary.data$count / sum(summary.data$count) * 100,1)
+
+summary.data["category"] <- factor(summary.data$category,
+                                   levels=c("No measurable degradation",
+                                            "Protein Synthesis Only",
+                                            "Net Protein Increase with Degradation",
+                                            "Balanced Protein Turnover",
+                                            "Protein Degradation Only"))
+
+# Create a pie chart
+deg.pie <- ggplot(summary.data, aes(x = 1, y = count, fill = category)) +
+  geom_bar(width = 1, stat = "identity", color = "black", alpha=0.8,
+           linewidth=0.25) +
+  coord_polar(theta = "y") +
+  xlim(0.5, 1.5) +
+  scale_fill_manual(values = c("grey100", "grey80", "grey55", "grey20", "black")) +
+  theme_void()
+
+deg.pie
+
+ggsave('test.png', bg="transparent", plot=deg.pie,width=4,height=4,units="in")
+
+```
+
+
+```{r Example proteins }
+
+plot_protein <- function(protein_id){
+
+  protein_sub <- XLA_fits_df[XLA_fits_df$Protein_ID==protein_id,]  
+
+  print(protein_sub$HL_Hrs)
+  
+  light_data <- as.numeric(protein_sub[10:17])
+  light_data <- light_data / light_data[1]
+  
+  heavy_data <- as.numeric(protein_sub[18:28])
+  heavy_data <- heavy_data / heavy_data[1]
+      
+  plot_data <- data.frame(Time=c(avg_light_time, avg_heavy_time),
+                          Values=c(light_data, heavy_data),
+                          Group=c(rep("Control", length(avg_light_time)),
+                                  rep("O18", length(avg_heavy_time))))  
+  plot_data["Time"] <- plot_data$Time/60
+  
+
+  p1 <- ggplot() +
+    geom_line(data=plot_data[plot_data$Group=="O18",],
+              aes(x=Time, y=Values, group=Group),
+              color="#36A893", size=3) +
+    geom_line(data=plot_data[plot_data$Group=="Control",],
+              aes(x=Time, y=Values, group=Group),
+              color="#767676", size=3) +    
+    theme_bw() +
+    theme(axis.text=element_text(size=18,colour="black"),
+          plot.title = element_text(size=22, hjust=0.5),
+          axis.title = element_blank(),
+          panel.border = element_rect(linewidth=2),
+          panel.grid.major = element_line(color = "grey90", linewidth = 0.25),
+          panel.grid.minor = element_line(color = "grey90", linewidth = 0.25),
+          legend.position = "none",
+          aspect.ratio = 1,
+          plot.margin = margin(t = 5, r = 5, b = 5,
+                               l = 5, unit = "pt")) +    
+    geom_hline(yintercept = 1, linetype="dashed", linewidth=1) +
+    coord_cartesian(ylim=c(0,2.25)) +
+    scale_y_continuous(breaks=c(0,1,2))
+  
+  return(p1) }
+
+# #Uncomment for new image!
+# tiff("graph.tiff", units="in",
+#      width=10, height=5, res=300)
+
+plot_protein("XBmRNA25690|XBXL10_1g13517") |
+plot_protein("XBmRNA30988|XBXL10_1g16504") |
+plot_protein("XBmRNA74431|XBXL10_1g39492") |
+plot_protein("XBmRNA32706|XBXL10_1g17749") |
+plot_protein("XBmRNA79420|XBXL10_1g42248")
+
+# dev.off() #Uncomment for new image!
+
+```
+
+
+```{r}
+
+sessionInfo()
+
+```
+
+
+
+
+
+
+
+
+
+
